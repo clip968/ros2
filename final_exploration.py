@@ -25,14 +25,10 @@ import math
 import json
 
 # ================= [설정] =================
-BOX_CLASS_NAME = "box"       # YOLO 클래스 이름
-BOX_APPROACH_DIST = 0.8      # 박스 앞 정지 거리 (m)
-CHECKED_BOX_RADIUS = 1.5     # 이미 검사한 박스 반경 (m)
-IMG_WIDTH = 320              # YOLO 입력 해상도 (px)
-CENTER_TOLERANCE = 40        # 중앙 정렬 허용 오차 (px)
-YOLO_CONF_THRESHOLD = 0.6    # YOLO 신뢰도 임계값
-ALIGN_TIMEOUT = 10.0         # 정렬 타임아웃 (초) - 넉넉하게
-ALIGN_LOST_COUNT = 10        # 박스 미감지 허용 횟수
+BOX_CLASS_NAME = "box"       # YOLO 클래스 이름 (모델에 맞게 수정)
+BOX_APPROACH_DIST = 0.6      # 박스 앞 정지 거리 (m)
+CHECKED_BOX_RADIUS = 1.0     # 이미 검사한 박스 반경 (m)
+YOLO_CONF_THRESHOLD = 0.5    # YOLO 신뢰도 임계값 (tflite와 맞춤)
 # ==========================================
 
 
@@ -68,9 +64,6 @@ class FinalExplorer(Node):
         self.box_detected = False
         self.checked_boxes = []  # [(x, y), ...] - 이미 간 박스 위치
         self.current_box_pos = None
-        self.last_box_cx = IMG_WIDTH / 2  # 마지막 박스 X 좌표
-        self.box_visible = False          # 현재 박스 보이는지
-        self.box_lost_count = 0           # 박스 놓친 횟수
         
         # 7. TF (위치 추적용)
         self.tf_buffer = Buffer()
@@ -98,7 +91,7 @@ class FinalExplorer(Node):
             self.front_distance = 2.0  # 기본값
 
     def yolo_callback(self, msg):
-        """박스 감지 시 바로 추적 접근"""
+        """박스 감지 시 위치 저장 후 Nav2로 접근"""
         try:
             detections = json.loads(msg.data)
         except json.JSONDecodeError:
@@ -114,42 +107,37 @@ class FinalExplorer(Node):
                 best_conf = conf
                 best_box = det
         
-        # 박스 중앙 X 좌표 저장 (DIRECT_APPROACH에서 추적용)
-        if best_box:
-            center = best_box.get('center', [IMG_WIDTH / 2, 0.0])
-            self.last_box_cx = center[0]
-            self.box_visible = True
-            self.box_lost_count = 0
-        else:
-            self.box_visible = False
-            self.box_lost_count = getattr(self, 'box_lost_count', 0) + 1
-        
-        # 이미 접근 중이면 추적 정보만 업데이트하고 리턴
-        if self.mode in ("APPROACH", "DIRECT_APPROACH"):
-            return
-        
         if not best_box:
             return
         
+        # 이미 접근 중이면 무시
+        if self.mode == "APPROACH":
+            return
+        
         # === 이미 확인한 박스인지 체크 ===
-        temp_pos = self.estimate_box_position()
-        if temp_pos and self.is_checked_box(*temp_pos):
+        box_pos = self.estimate_box_position()
+        if not box_pos:
+            return
+        
+        if self.is_checked_box(*box_pos):
             return  # 이미 간 박스는 무시
         
-        # === 박스 발견 -> 바로 직접 접근 모드! ===
-        self.get_logger().info(f"박스 발견! 바로 접근 시작 (cx={self.last_box_cx:.1f})")
-        self.cancel_nav()
-        self.box_detected = True
-        self.mode = "DIRECT_APPROACH"
+        # === 박스 발견 -> 멈추고 위치 저장 -> Nav2 APPROACH 모드! ===
+        self.get_logger().info(f"박스 발견! 위치=({box_pos[0]:.2f}, {box_pos[1]:.2f}), 거리={self.front_distance:.2f}m")
         
-        # 현재 위치 저장 (나중에 박스 위치로 기록)
-        pose = self.get_robot_pose()
-        if pose:
-            # 대략적인 박스 위치 추정
-            dist = min(self.front_distance, 3.0)
-            bx = pose[0] + dist * math.cos(pose[2])
-            by = pose[1] + dist * math.sin(pose[2])
-            self.current_box_pos = (bx, by)
+        # 1. Nav2 취소
+        self.cancel_nav()
+        
+        # 2. 정지 명령 (여러 번)
+        self.stop_robot()
+        
+        # 3. 잠시 대기 (정지 확인)
+        time.sleep(0.3)
+        self.stop_robot()  # 한 번 더
+        
+        self.box_detected = True
+        self.current_box_pos = box_pos
+        self.mode = "APPROACH"
 
     # ===== 유틸리티 =====
     def get_robot_pose(self):
@@ -185,9 +173,6 @@ class FinalExplorer(Node):
         """Nav2 제어 중단 요청"""
         self.is_navigating = False
         self.cancel_nav_requested = True
-        # 정지 명령을 여러 번 보내서 확실히 멈춤
-        for _ in range(3):
-            self.publish_cmd_vel(0.0, 0.0)
         self.get_logger().info("Nav2 취소 요청")
     
     def publish_cmd_vel(self, linear_x, angular_z):
@@ -198,8 +183,12 @@ class FinalExplorer(Node):
         self.cmd_vel_pub.publish(msg)
     
     def stop_robot(self):
-        """로봇 정지"""
-        self.publish_cmd_vel(0.0, 0.0)
+        """로봇 정지 - 여러 번 발행해서 확실히 멈춤"""
+        self.get_logger().info("정지 명령 발행!")
+        # 1초 동안 계속 정지 명령 발행 (collision_monitor 덮어쓰기)
+        for _ in range(50):  # 50번 발행
+            self.publish_cmd_vel(0.0, 0.0)
+            time.sleep(0.02)  # 20ms 간격 = 총 1초
 
     def wait_with_spin(self, duration_sec):
         """spin을 유지하면서 대기 (콜백 처리 계속)"""
@@ -311,61 +300,12 @@ def main():
                 node.stop_robot()
                 continue  # 이번 루프는 스킵하고 다음으로
             
-            # === 직접 직진 모드 (DIRECT_APPROACH) ===
-            # Nav2 없이 직접 cmd_vel로 박스에 접근 (추적하며 직진)
-            if node.mode == "DIRECT_APPROACH":
-                dist = node.front_distance
-                
-                # 박스 놓친 경우 체크
-                if node.box_lost_count > 30:  # 약 3초간 못 봄
-                    print("박스 놓침 -> 탐사 복귀")
-                    node.stop_robot()
-                    node.mode = "EXPLORE"
-                    node.box_detected = False
-                    node.box_lost_count = 0
-                    continue
-                
-                # 도착 체크
-                if dist <= BOX_APPROACH_DIST:
-                    # 박스 앞 도착!
-                    node.stop_robot()
-                    print(f"박스 앞 도착! (거리: {dist:.2f}m)")
-                    node.wait_with_spin(3.0)
-                    
-                    # 현재 위치를 박스 위치로 기록
-                    pose = node.get_robot_pose()
-                    if pose:
-                        node.checked_boxes.append((pose[0], pose[1]))
-                        print(f"박스 위치 기록 (총 {len(node.checked_boxes)}개)")
-                    
-                    node.mode = "EXPLORE"
-                    node.box_detected = False
-                    node.box_lost_count = 0
-                else:
-                    # 추적하며 직진!
-                    # 박스 X 위치에 따라 회전 보정
-                    err = (IMG_WIDTH / 2) - node.last_box_cx
-                    angular_z = 0.006 * err  # P 제어
-                    angular_z = max(min(angular_z, 0.4), -0.4)
-                    
-                    # 직진 + 회전
-                    linear_x = 0.15  # 전진 속도
-                    node.publish_cmd_vel(linear_x, angular_z)
-                    
-                    if node.box_visible:
-                        print(f"추적 직진: 거리={dist:.2f}m, 오차={err:.0f}px, 회전={angular_z:.2f}")
-                    else:
-                        print(f"박스 안 보임 (직진 유지): 거리={dist:.2f}m")
-                    
-                    time.sleep(0.1)
-                continue
-            
             # === Nav2 접근 모드 (APPROACH) ===
             if node.mode == "APPROACH":
                 if node.current_box_pos is None:
-                    # 위치 모르면 직접 직진 모드로!
-                    print("박스 위치 없음 -> 직접 직진 모드")
-                    node.mode = "DIRECT_APPROACH"
+                    print("박스 위치 없음 -> 탐사 복귀")
+                    node.mode = "EXPLORE"
+                    node.box_detected = False
                     continue
                 
                 if not node.is_navigating:
@@ -383,7 +323,13 @@ def main():
                         qz = math.sin(angle / 2)
                         qw = math.cos(angle / 2)
                         
-                        print(f"박스 접근: ({tx:.2f}, {ty:.2f}), 방향: {math.degrees(angle):.1f} deg")
+                        print(f"[APPROACH] 박스 접근 시작!")
+                        print(f"  현재 위치: ({rx:.2f}, {ry:.2f})")
+                        print(f"  박스 위치: ({bx:.2f}, {by:.2f})")
+                        print(f"  목표 위치: ({tx:.2f}, {ty:.2f})")
+                        
+                        # Nav2 goal 설정 전 잠시 대기
+                        time.sleep(0.2)
                         
                         goal = PoseStamped()
                         goal.header.frame_id = 'map'
@@ -393,13 +339,16 @@ def main():
                         goal.pose.orientation.z = qz
                         goal.pose.orientation.w = qw
                         
+                        # Nav2 goal 전송
                         nav.goToPose(goal)
+                        print(f"[APPROACH] Nav2 goal 전송 완료!")
+                        
                         node.is_navigating = True
                         node.box_detected = False
                     else:
-                        # 위치 모르면 직접 직진!
-                        print("로봇 위치 불명 -> 직접 직진 모드")
-                        node.mode = "DIRECT_APPROACH"
+                        print("로봇 위치 불명 -> 탐사 복귀")
+                        node.mode = "EXPLORE"
+                        node.box_detected = False
                 
                 elif nav.isTaskComplete():
                     result = nav.getResult()
