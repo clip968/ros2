@@ -12,3 +12,6 @@ ros2 launch turtlebot4_navigation nav2.launch.py \
 ros2 launch turtlebot4_navigation nav2.launch.py \
   use_sim_time:=false \
   params_file:=/home/clip968/ros2/no_backward_params.yaml
+
+  oakd_rgb_camera_frame
+  rplidar_link
