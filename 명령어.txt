@@ -1,0 +1,14 @@
+
+ros2 launch /home/clip968/ros2_ws/start_exploration.launch.py
+ros2 launch turtlebot4_navigation slam.launch.py
+ros2 launch turtlebot4_navigation localization.launch.py map:=map_name.yaml
+ros2 launch turtlebot4_viz view_navigation.launch.py
+ros2 launch turtlebot4_navigation nav2.launch.py params_file:=/home/clip968/ros2_ws/nav2_params.yaml
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p stamped:=true
+ros2 launch turtlebot4_navigation nav2.launch.py \
+  use_sim_time:=false \
+  localization:=false \
+  params_file:=/home/clip968/ros2/no_backward_params.yaml
+ros2 launch turtlebot4_navigation nav2.launch.py \
+  use_sim_time:=false \
+  params_file:=/home/clip968/ros2/no_backward_params.yamlt

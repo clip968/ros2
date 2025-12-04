@@ -18,6 +18,7 @@ import cv2
 import time
 import numpy as np
 import json
+import math
 
 # ================= [설정] =================
 MODEL_PATH = "yolov11_best.pt"
@@ -29,8 +30,14 @@ TARGET_FPS = 12
 # 이미지 크기
 IMG_SIZE = 320
 
+# 카메라 수평 시야각 (deg) - OAK-D 기본값 기준
+CAMERA_HFOV_DEG = 69.0
+
 # 신뢰도 임계값
-CONF_THRESHOLD = 0.45
+CONF_THRESHOLD = 0.75
+
+# 박스 좌표 평균화 설정
+BOX_BUFFER_SIZE = 15  # 몇 개 모아서 평균 낼지
 # ==========================================
 
 
@@ -76,6 +83,10 @@ class Yolo11Node(Node):
         self.frame_count = 0
         self.fps_start_time = time.time()
         
+        # 박스 좌표 버퍼 (평균화용)
+        self.box_buffer = []  # [{angle_rad, conf, center}, ...]
+        self.no_box_count = 0  # 박스 미감지 연속 횟수
+        
         # 타이머: 고정 FPS로 처리
         timer_period = 1.0 / TARGET_FPS
         self.timer = self.create_timer(timer_period, self.process_frame)
@@ -93,6 +104,7 @@ class Yolo11Node(Node):
             return
         
         frame = self.latest_frame.copy()
+        frame_h, frame_w = frame.shape[:2]
         self.frame_count += 1
         
         try:
@@ -108,26 +120,84 @@ class Yolo11Node(Node):
             
             # 결과 파싱
             self.last_boxes = []
+            half_fov_rad = math.radians(CAMERA_HFOV_DEG) / 2.0
+            half_frame_w = frame_w / 2.0 if frame_w else 1.0
+
             for r in results:
                 for box in r.boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     cls_id = int(box.cls[0])
                     conf = float(box.conf[0])
                     name = self.model.names.get(cls_id, f"ID:{cls_id}")
+                    cx = (x1 + x2) / 2.0
+                    cy = (y1 + y2) / 2.0
+                    bearing_ratio = (cx - half_frame_w) / half_frame_w
+                    angle_rad = max(-half_fov_rad,
+                                    min(half_fov_rad, bearing_ratio * half_fov_rad))
                     
                     self.last_boxes.append({
                         'box': [x1, y1, x2, y2],
-                        'center': [(x1+x2)/2, (y1+y2)/2],  # 중심점 추가
+                        'center': [cx, cy],  # 중심점 추가
                         'label': f"{name} {conf:.2f}",
                         'name': name,
-                        'conf': conf
+                        'conf': conf,
+                        'angle_rad': angle_rad,
+                        'angle_deg': math.degrees(angle_rad)
                     })
             
-            # JSON 토픽 발행 (탐사 노드용)
-            if self.last_boxes:
-                det_msg = String()
-                det_msg.data = json.dumps(self.last_boxes)
-                self.det_pub.publish(det_msg)
+            # 박스 감지 여부 확인
+            box_detections = [item for item in self.last_boxes if item['name'].lower() == 'box']
+            
+            # 박스 좌표 버퍼링 및 평균화 발행
+            if box_detections:
+                self.no_box_count = 0  # 리셋
+                
+                # 가장 신뢰도 높은 박스 선택
+                best_box = max(box_detections, key=lambda x: x['conf'])
+                
+                # 버퍼에 추가
+                self.box_buffer.append({
+                    'angle_rad': best_box['angle_rad'],
+                    'angle_deg': best_box['angle_deg'],
+                    'conf': best_box['conf'],
+                    'center': best_box['center']
+                })
+                
+                # 버퍼가 다 차면 평균 계산 후 발행
+                if len(self.box_buffer) >= BOX_BUFFER_SIZE:
+                    avg_angle_rad = sum(b['angle_rad'] for b in self.box_buffer) / len(self.box_buffer)
+                    avg_angle_deg = sum(b['angle_deg'] for b in self.box_buffer) / len(self.box_buffer)
+                    avg_conf = sum(b['conf'] for b in self.box_buffer) / len(self.box_buffer)
+                    avg_cx = sum(b['center'][0] for b in self.box_buffer) / len(self.box_buffer)
+                    avg_cy = sum(b['center'][1] for b in self.box_buffer) / len(self.box_buffer)
+                    
+                    # 평균 좌표로 토픽 발행
+                    avg_box = {
+                        'name': 'box',
+                        'angle_rad': avg_angle_rad,
+                        'angle_deg': avg_angle_deg,
+                        'conf': avg_conf,
+                        'center': [avg_cx, avg_cy]
+                    }
+                    det_msg = String()
+                    det_msg.data = json.dumps([avg_box])
+                    self.det_pub.publish(det_msg)
+                    
+                    self.get_logger().warn(
+                        f"🎯 박스 평균 좌표 발행! "
+                        f"각도={avg_angle_deg:.1f}deg, conf={avg_conf:.2f}, "
+                        f"중심=({avg_cx:.0f}, {avg_cy:.0f})"
+                    )
+                    
+                    # 버퍼 초기화 → 다시 모으기 시작
+                    self.box_buffer = []
+            else:
+                # 박스 미감지 시 카운트 증가
+                self.no_box_count += 1
+                # 5프레임 이상 미감지면 버퍼 초기화 (새 박스 준비)
+                if self.no_box_count >= 5 and self.box_buffer:
+                    self.get_logger().info("박스 미감지 - 버퍼 초기화")
+                    self.box_buffer = []
             
             # 시각화
             for item in self.last_boxes:
