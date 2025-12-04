@@ -11,4 +11,4 @@ ros2 launch turtlebot4_navigation nav2.launch.py \
   params_file:=/home/clip968/ros2/no_backward_params.yaml
 ros2 launch turtlebot4_navigation nav2.launch.py \
   use_sim_time:=false \
-  params_file:=/home/clip968/ros2/no_backward_params.yamlt
+  params_file:=/home/clip968/ros2/no_backward_params.yaml

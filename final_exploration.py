@@ -17,6 +17,7 @@ from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import PoseStamped, Quaternion, Twist
 from std_msgs.msg import String
+from visualization_msgs.msg import Marker
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 from tf2_ros import Buffer, TransformListener
 import numpy as np
@@ -45,6 +46,7 @@ class FinalExplorer(Node):
         
         # 2. 퍼블리셔
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.marker_pub = self.create_publisher(Marker, '/box_marker', 10)
         
         # 3. 데이터 변수
         self.map_data = None
@@ -171,43 +173,50 @@ class FinalExplorer(Node):
             return None
 
     def get_distance_along_angle(self, angle_rad):
-        """라이다 데이터를 사용해 특정 각도의 거리를 구함"""
+        """
+        개선된 거리 측정:
+        단일 각도가 아니라, 해당 각도 주변(Cone)을 스캔하여
+        가장 가까운 물체(박스일 확률 높음)의 거리를 반환
+        """
         if self.last_scan is None:
             self.get_logger().warn("LiDAR 데이터 없음 - 거리 추정 실패")
             return None
+            
         scan = self.last_scan
         angle_min = scan.angle_min
-        angle_max = scan.angle_min + scan.angle_increment * (len(scan.ranges) - 1)
+        angle_inc = scan.angle_increment
         
-        self.get_logger().info(
-            f"라이다 범위: {math.degrees(angle_min):.1f}~{math.degrees(angle_max):.1f}deg, "
-            f"요청 각도: {math.degrees(angle_rad):.1f}deg"
-        )
+        # 1. YOLO 각도에 해당하는 라이다 인덱스 계산
+        center_idx = int(round((angle_rad - angle_min) / angle_inc))
         
-        if angle_rad < angle_min or angle_rad > angle_max:
-            self.get_logger().warn(
-                f"요청 각도({math.degrees(angle_rad):.1f}deg)가 스캔 범위를 벗어남! "
-                f"라이다 범위: {math.degrees(angle_min):.1f}~{math.degrees(angle_max):.1f}deg"
-            )
-            # 정면 거리로 대체
-            self.get_logger().info("정면 거리로 대체 시도...")
-            return self.front_distance if self.front_distance < float('inf') else None
+        # 2. 탐색 범위 설정 (예: ±10도) -> 라이다 인덱스 범위
+        search_angle_deg = 10.0 
+        search_width = int(math.radians(search_angle_deg) / angle_inc)
+        
+        start_idx = max(0, center_idx - search_width)
+        end_idx = min(len(scan.ranges), center_idx + search_width + 1)
+        
+        # 3. 유효한 거리 데이터 추출
+        valid_dists = []
+        for r in scan.ranges[start_idx:end_idx]:
+            if scan.range_min < r < scan.range_max:
+                valid_dists.append(r)
+                
+        if not valid_dists:
+            self.get_logger().warn("해당 각도 범위에 유효한 라이다 데이터 없음")
+            return None
             
-        index = int(round((angle_rad - angle_min) / scan.angle_increment))
-        window = 2  # ±2 샘플 평균 -> 노이즈 완화
-        start = max(0, index - window)
-        end = min(len(scan.ranges), index + window + 1)
-        valid = [
-            dist for dist in scan.ranges[start:end]
-            if scan.range_min < dist < scan.range_max
-        ]
-        if not valid:
-            self.get_logger().warn("해당 각도에서 유효한 라이다 거리 없음 - 정면 거리로 대체")
-            return self.front_distance if self.front_distance < float('inf') else None
-        return min(valid)
+        # 4. 가장 가까운 거리 반환 (박스는 벽보다 앞에 튀어나와 있음)
+        # 노이즈 방지를 위해 너무 가까운 값(0.1m 이하)은 제외할 수도 있음
+        min_dist = min(valid_dists)
+        
+        # 디버깅용 로그
+        self.get_logger().info(f"YOLO각도: {math.degrees(angle_rad):.1f} | 측정거리: {min_dist:.2f}m")
+        
+        return min_dist
 
     def estimate_box_position(self, detection):
-        """YOLO가 준 각도 정보를 이용해 박스 월드 좌표 추정"""
+        """YOLO가 준 각도 정보를 이용해 박스 월드 좌표 추정 (위치 추정 로직 보완)"""
         pose = self.get_robot_pose()
         if not pose:
             self.get_logger().warn("TF 조회 실패 - 로봇 위치 모름")
@@ -218,22 +227,44 @@ class FinalExplorer(Node):
             self.get_logger().warn("YOLO 감지 데이터에 angle_rad 없음")
             return None
 
-        rx, ry, ryaw = pose
-        distance = detection.get('range_m')
-        if distance is None:
-            distance = self.get_distance_along_angle(angle_rad)
-        if distance is None:
-            self.get_logger().warn("박스 거리 추정 실패 (라이다/센서 데이터 부족)")
+        # 거리 측정 (개선된 함수 사용)
+        distance = self.get_distance_along_angle(angle_rad)
+        
+        # 거리가 너무 멀면(예: 3.5m 이상) 박스가 아니라 벽일 수 있음 -> 무시하거나 접근 보류
+        if distance is None or distance > 3.5:
+            self.get_logger().warn(f"측정된 거리가 너무 멀음 ({distance}m). 박스가 아닐 수 있음.")
             return None
 
-        distance = min(distance, 3.0)  # 안전을 위해 최대 3m 제한
+        rx, ry, ryaw = pose
+        
+        # 월드 좌표 계산
         heading = ryaw + angle_rad
         bx = rx + distance * math.cos(heading)
         by = ry + distance * math.sin(heading)
+        
         self.front_distance = distance
         self.get_logger().info(
             f"박스 추정: bearing={math.degrees(angle_rad):.1f}deg, 거리={distance:.2f}m, 위치=({bx:.2f}, {by:.2f})"
         )
+        
+        # Rviz 시각화 마커 발행
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = bx
+        marker.pose.position.y = by
+        marker.pose.position.z = 0.2
+        marker.scale.x = 0.2
+        marker.scale.y = 0.2
+        marker.scale.z = 0.2
+        marker.color.a = 1.0
+        marker.color.r = 1.0  # 빨간색 구체
+        marker.color.g = 0.0
+        marker.color.b = 0.0
+        self.marker_pub.publish(marker)
+        
         return bx, by
 
     def is_checked_box(self, bx, by):
