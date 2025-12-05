@@ -160,7 +160,8 @@ class Yolo11Node(Node):
                     'angle_rad': best_box['angle_rad'],
                     'angle_deg': best_box['angle_deg'],
                     'conf': best_box['conf'],
-                    'center': best_box['center']
+                    'center': best_box['center'],
+                    'box': [x1, y1, x2, y2],
                 })
                 
                 # 버퍼가 다 차면 평균 계산 후 발행
@@ -170,6 +171,10 @@ class Yolo11Node(Node):
                     avg_conf = sum(b['conf'] for b in self.box_buffer) / len(self.box_buffer)
                     avg_cx = sum(b['center'][0] for b in self.box_buffer) / len(self.box_buffer)
                     avg_cy = sum(b['center'][1] for b in self.box_buffer) / len(self.box_buffer)
+                    avg_box_x1 = sum(b['box'][0] for b in self.box_buffer) / len(self.box_buffer)
+                    avg_box_y1 = sum(b['box'][1] for b in self.box_buffer) / len(self.box_buffer)
+                    avg_box_x2 = sum(b['box'][2] for b in self.box_buffer) / len(self.box_buffer)
+                    avg_box_y2 = sum(b['box'][3] for b in self.box_buffer) / len(self.box_buffer)
                     
                     # 평균 좌표로 토픽 발행
                     avg_box = {
@@ -177,8 +182,10 @@ class Yolo11Node(Node):
                         'angle_rad': avg_angle_rad,
                         'angle_deg': avg_angle_deg,
                         'conf': avg_conf,
-                        'center': [avg_cx, avg_cy]
+                        'center': [avg_cx, avg_cy],
+                        'box': [avg_box_x1, avg_box_y1, avg_box_x2, avg_box_y2]
                     }
+                    
                     det_msg = String()
                     det_msg.data = json.dumps([avg_box])
                     self.det_pub.publish(det_msg)
