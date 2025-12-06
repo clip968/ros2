@@ -25,6 +25,8 @@ import cv2
 import time
 import math
 import json
+from stop_utils import CmdStopper
+from frontier_utils import compute_frontier_goal
 
 # ================= [설정] =================
 BOX_CLASS_NAME = "box"       # YOLO 클래스 이름 (모델에 맞게 수정)
@@ -48,6 +50,7 @@ class FinalExplorer(Node):
         # 2. 퍼블리셔
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.marker_pub = self.create_publisher(Marker, '/box_marker', 10)
+        self.stopper = CmdStopper(self.cmd_vel_pub, spin_node=self)
         
         # 3. 데이터 변수
         self.map_data = None
@@ -328,13 +331,10 @@ class FinalExplorer(Node):
         msg.angular.z = float(angular_z)
         self.cmd_vel_pub.publish(msg)
     
-    def stop_robot(self):
-        """로봇 정지 - 여러 번 발행해서 확실히 멈춤"""
+    def stop_robot(self, duration_sec=0.5):
+        """정지 헬퍼 호출"""
         self.get_logger().info("정지 명령 발행!")
-        # 1초 동안 계속 정지 명령 발행 (collision_monitor 덮어쓰기)
-        for _ in range(50):  # 50번 발행
-            self.publish_cmd_vel(0.0, 0.0)
-            time.sleep(0.02)  # 20ms 간격 = 총 1초
+        self.stopper.stop_now(duration_sec)
 
     def wait_with_spin(self, duration_sec):
         """spin을 유지하면서 대기 (콜백 처리 계속)"""
@@ -374,88 +374,6 @@ class FinalExplorer(Node):
         return False
 
     # ===== Frontier 로직 =====
-    def get_frontier_point(self):
-        if self.map_data is None:
-            return None
-        
-        # 1. 마스크 생성
-        # occupiedgrid값 
-        # 0 = free, -1 = unknown, 100 = occupied
-        grid = self.map_data
-        free_mask = (grid == 0).astype(np.uint8) * 255
-        unknown_mask = (grid == -1).astype(np.uint8) * 255
-        
-        # 2. Frontier 검출
-        kernel = np.ones((3, 3), np.uint8)
-        # free 영역을 3x3 커널로 1픽셀 확장
-        dilated_free = cv2.dilate(free_mask, kernel, iterations=1)
-        # 확장된 free와 unknown 마스크를 비트워드 연산으로 결합
-        # 겹치는 부분 = frontier
-        frontier = cv2.bitwise_and(dilated_free, unknown_mask)
-        contours, _ = cv2.findContours(frontier, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
-            return None
-        
-        # 3. 후보 선정
-        candidates = []
-        for cnt in contours:
-            # 너무 작은 frontier 무시
-            if len(cnt) < 5:
-                continue
-            
-            # 중심점 찾기
-            m = cv2.moments(cnt)
-            if m['m00'] == 0:
-                continue
-            cx = int(m['m10'] / m['m00'])
-            cy = int(m['m01'] / m['m00'])
-            
-            # 안전한 위치로 보정 (Safe Point)
-            safe_pt = self.find_safe_point(cx, cy)
-            if not safe_pt:
-                continue
-            
-            # 그리드 좌표를 map 좌표로 변환
-            wx, wy = self.grid_to_world(*safe_pt)
-            
-            # 점수: 크기(len) - 이전목표거리페널티
-            # frontier가 클 수록 높은 점수(넓은 미탐사 영역)
-            # 뭔 개소리인지 모르겠음
-            score = len(cnt)
-            if self.last_goal:
-                dist = math.hypot(wx - self.last_goal[0], wy - self.last_goal[1])
-                if dist < 1.0:
-                    score *= 0.1  # 갔던 곳 회피
-                
-            candidates.append((score, wx, wy))
-            
-        if not candidates:
-            return None
-        
-        # 점수순 정렬
-        candidates.sort(reverse=True, key=lambda x: x[0])
-        return candidates[0][1], candidates[0][2]
-
-    def find_safe_point(self, cx, cy):
-        """주변 5픽셀 내에서 가장 안전한 Free 공간 찾기"""
-        rows, cols = self.map_data.shape
-        for r in range(max(0, cy - 5), min(rows, cy + 6)):
-            for c in range(max(0, cx - 5), min(cols, cx + 6)):
-                if self.map_data[r, c] == 0:
-                    # 너무 가까운(경계선) 곳은 피함 (2픽셀 이상)
-                    if abs(r - cy) + abs(c - cx) > 2:
-                        return c, r  # (x, y)
-        return None
-
-    def grid_to_world(self, gx, gy):
-        """그리드 좌표 -> 월드 좌표 변환"""
-        ox = self.map_info.origin.position.x
-        oy = self.map_info.origin.position.y
-        res = self.map_info.resolution
-        return ox + gx * res, oy + gy * res
-
-
 def main():
     rclpy.init()
     node = FinalExplorer()
@@ -474,6 +392,10 @@ def main():
     try:
         while rclpy.ok():
             rclpy.spin_once(node, timeout_sec=0.1)
+            
+            # 강제 정지 유지 구간: 다른 cmd_vel을 덮어쓰기
+            if node.stopper.enforce_stop():
+                continue
             
             # Nav2 취소 요청 처리
             if node.cancel_nav_requested:
@@ -573,7 +495,7 @@ def main():
             # === 탐사 모드 (EXPLORE) ===
             elif node.mode == "EXPLORE":
                 if not node.is_navigating:
-                    target = node.get_frontier_point()
+                    target = compute_frontier_goal(node.map_data, node.map_info, node.last_goal)
                     if target:
                         tx, ty = target
                         print(f"\n탐사 목표: ({tx:.2f}, {ty:.2f})")
