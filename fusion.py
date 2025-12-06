@@ -228,17 +228,44 @@ class LidarCameraProjector(Node):
         imgmsg = self.bridge.cv2_to_imgmsg(overlay, encoding="bgr8")
         self.fusion_pub.publish(imgmsg)
 
+    def lidar_to_map(self, local_x, local_y):
+        """라이다 좌표계 → map 좌표계 변환"""
+        try:
+            # 라이다 프레임 → map 프레임 TF 조회
+            tf = self.tf_buffer.lookup_transform('map', self.frame_lidar, rclpy.time.Time())
+            
+            # 변환 행렬 생성
+            T = self.tf_to_matrix(tf)
+            
+            # 라이다 좌표를 동차 좌표로 변환
+            pt_lidar = np.array([local_x, local_y, 0.0, 1.0])
+            
+            # map 좌표로 변환
+            pt_map = T @ pt_lidar
+            
+            return float(pt_map[0]), float(pt_map[1])
+        except Exception as e:
+            self.get_logger().warn(f"라이다→map 변환 실패: {e}")
+            return None
+
     def clustering(self, filtered_scan: LaserScan):
         X = []
         angle = filtered_scan.angle_min
         for i, r in enumerate(filtered_scan.ranges):
-            if np.isfinite(r):
+            # 유효한 거리만 사용 (0보다 크고 유한한 값)
+            if r > 0.05 and np.isfinite(r):
                 x = r * np.cos(angle)
                 y = r * np.sin(angle)
-                z = 0.0
-                X.append([x,y,z])
-
+                X.append([x, y])
             angle += filtered_scan.angle_increment
+        
+        # 최소 점 개수 체크
+        if len(X) < self.MIN_POINTS:
+            self.get_logger().info(f"유효 점 부족: {len(X)}개 (최소 {self.MIN_POINTS}개 필요)")
+            return
+        
+        # 리스트를 numpy 배열로 변환
+        X = np.array(X)
         
         db = DBSCAN(eps=self.EPSILON, min_samples=self.MIN_POINTS).fit(X)
         labels = db.labels_
@@ -247,22 +274,30 @@ class LidarCameraProjector(Node):
             cluster_0_mask = (labels == 0)
             cluster_0_points = X[cluster_0_mask]
             
-            # NumPy의 np.mean 함수를 사용하여 평균을 한 번에 계산
-            avg_x, avg_y, avg_z = np.mean(cluster_0_points, axis=0)
+            # NumPy의 np.mean 함수를 사용하여 평균을 한 번에 계산 (라이다 좌표계)
+            local_x, local_y = np.mean(cluster_0_points, axis=0)
             
-            self.get_logger().warn(
-                f"🎯 Cluster 0 Center: X={avg_x:.3f}m, Y={avg_y:.3f}m, "
-                f"Total points: {len(cluster_0_points)}"
-            )
+            # 라이다 좌표 → map 좌표 변환
+            map_pos = self.lidar_to_map(local_x, local_y)
             
-            fusion_box_pt = Float32MultiArray()
-            fusion_box_pt.data = [avg_x, avg_y]
-            self.fusion_box_pt_pub.publish(fusion_box_pt)
+            if map_pos:
+                map_x, map_y = map_pos
+                self.get_logger().warn(
+                    f"🎯 박스 위치: 라이다=({local_x:.2f}, {local_y:.2f}), "
+                    f"월드=({map_x:.2f}, {map_y:.2f}), 점={len(cluster_0_points)}개"
+                )
+                
+                # 월드 좌표로 발행!
+                fusion_box_pt = Float32MultiArray()
+                fusion_box_pt.data = [map_x, map_y]
+                self.fusion_box_pt_pub.publish(fusion_box_pt)
+            else:
+                self.get_logger().warn(f"박스 감지했으나 좌표 변환 실패")
 
         else:
-            self.get_logger().info("Cluster 0 not found.")
+            self.get_logger().info("박스 클러스터 없음")
 
-        self.get_logger().info(f"{np.unique(labels)}")
+        self.get_logger().info(f"클러스터 라벨: {np.unique(labels)}")
 
     def cb_scan(self, msg: LaserScan):
         self.latest_scan = msg

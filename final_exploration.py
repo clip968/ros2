@@ -16,7 +16,7 @@ from rclpy.duration import Duration
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import PoseStamped, Quaternion, Twist
-from std_msgs.msg import String
+from std_msgs.msg import String, Float32MultiArray
 from visualization_msgs.msg import Marker
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 from tf2_ros import Buffer, TransformListener
@@ -43,6 +43,7 @@ class FinalExplorer(Node):
         self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
         self.create_subscription(String, '/yolo_detections', self.yolo_callback, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
+        self.create_subscription(Float32MultiArray, '/fusion_box_point', self.fusion_callback, 10)
         
         # 2. 퍼블리셔
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -71,11 +72,15 @@ class FinalExplorer(Node):
         self.current_box_pos = None
         self.shutdown_requested = False
         
-        # 7. TF (위치 추적용)
+        # 7. 퓨전 박스 위치 (월드 좌표)
+        self.fusion_box_world = None  # (x, y) - 월드 좌표 (map 프레임)
+        self.fusion_box_timestamp = None  # 수신 시간
+        
+        # 8. TF (위치 추적용)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         
-        self.get_logger().info("최종 탐사 노드 시작")
+        self.get_logger().info("최종 탐사 노드 시작 (퓨전 모드)")
 
     # ===== 콜백 함수 =====
     def map_callback(self, msg):
@@ -98,6 +103,29 @@ class FinalExplorer(Node):
             self.front_distance = min(valid_dists)
         else:
             self.front_distance = 2.0  # 기본값
+
+    def fusion_callback(self, msg):
+        """fusion.py에서 계산한 박스 위치 수신 (이미 월드 좌표!)"""
+        if len(msg.data) >= 2:
+            world_x, world_y = msg.data[0], msg.data[1]
+            self.fusion_box_world = (world_x, world_y)  # 월드 좌표로 저장
+            self.fusion_box_timestamp = time.time()
+            
+            self.get_logger().info(
+                f"🎯 퓨전 박스 수신 (월드 좌표): ({world_x:.2f}, {world_y:.2f})"
+            )
+
+    def local_to_world(self, local_x, local_y):
+        """로봇 기준 좌표 → 월드 좌표 변환"""
+        pose = self.get_robot_pose()
+        if not pose:
+            return None
+        rx, ry, ryaw = pose
+        
+        # 회전 변환
+        world_x = rx + local_x * math.cos(ryaw) - local_y * math.sin(ryaw)
+        world_y = ry + local_x * math.sin(ryaw) + local_y * math.cos(ryaw)
+        return world_x, world_y
 
     def yolo_callback(self, msg):
         """박스 감지 시 위치 저장 후 Nav2로 접근"""
@@ -132,8 +160,21 @@ class FinalExplorer(Node):
             self.get_logger().info("이미 APPROACH 모드 - 무시")
             return
         
-        # === 이미 확인한 박스인지 체크 ===
-        box_pos = self.estimate_box_position(best_box)
+        # === 박스 위치 추정 (퓨전 우선, 없으면 기존 방식) ===
+        box_pos = None
+        
+        # 1. 퓨전 데이터가 최근 것이면 사용 (1초 이내)
+        if self.fusion_box_world and self.fusion_box_timestamp:
+            age = time.time() - self.fusion_box_timestamp
+            if age < 1.0:
+                box_pos = self.fusion_box_world  # 이미 월드 좌표!
+                self.get_logger().info(f"📍 퓨전 기반 박스 위치 사용 (age={age:.2f}s)")
+        
+        # 2. 퓨전 데이터 없으면 기존 방식 (각도 + 라이다)
+        if not box_pos:
+            self.get_logger().info("📍 기존 방식 (YOLO 각도 + 라이다) 사용")
+            box_pos = self.estimate_box_position(best_box)
+        
         if not box_pos:
             self.get_logger().error("❌ 박스 위치 추정 실패!")
             return
