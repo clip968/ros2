@@ -160,8 +160,8 @@ class LidarCameraProjector(Node):
             # BBox 정보가 없으면, 퓨전 이미지만 발행하고 필터링 스캔은 건너뜀
             pass 
         else:
-            # 현재는 가장 신뢰도 높은 'box' 하나만 처리한다고 가정합니다.
-            best_bbox = self.latest_bboxes[0]
+            # 신뢰도(conf) 가장 높은 박스 선택
+            best_bbox = max(self.latest_bboxes, key=lambda b: b.get("conf", 0.0))
             x1, y1, x2, y2 = best_bbox.get('box') # YOLO 노드가 이 키를 보장해야 함
 
             for i, (u, v) in enumerate(uv):
@@ -195,6 +195,10 @@ class LidarCameraProjector(Node):
         if self.latest_bboxes:
             self.get_logger().info(f"BBox 내 LiDAR 점 감지: {bbox_hits}개")
             
+            if bbox_hits == 0:
+                self.get_logger().info("BBox 있지만 LiDAR 히트 0 → 발행/클러스터 건너뜀")
+                return
+
             filtered_msg = LaserScan()
             filtered_msg.header = self.latest_scan.header
             filtered_msg.angle_min = self.latest_scan.angle_min
@@ -205,16 +209,11 @@ class LidarCameraProjector(Node):
             filtered_msg.range_min = self.latest_scan.range_min
             filtered_msg.range_max = self.latest_scan.range_max
             
-            # inf가 아닌 값만 유효한 거리로 간주하고, inf는 range_max로 변경 (혹은 그대로 inf)
-            # 여기서는 inf를 그대로 사용하거나, 노이즈 방지를 위해 range_max로 설정 가능
-            final_ranges = []
-            for r in filtered_ranges:
-                if r == float('inf'):
-                    final_ranges.append(0.0) # 유효하지 않은 값은 0.0 (또는 inf, NaN)
-                else:
-                    final_ranges.append(r)
-            
-            filtered_msg.ranges = final_ranges
+            # inf는 그대로 유지하여 "측정 없음"으로 전달
+            filtered_msg.ranges = [
+                r if r != float('inf') else float('inf')
+                for r in filtered_ranges
+            ]
 
             # YOLO 노드의 angle_deg/rad 정보를 ranges에 반영할 방법이 없으므로,
             # intensity 필드에 박스의 각도 정보를 넣거나, 

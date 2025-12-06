@@ -28,7 +28,7 @@ import json
 
 # ================= [설정] =================
 BOX_CLASS_NAME = "box"       # YOLO 클래스 이름 (모델에 맞게 수정)
-BOX_APPROACH_DIST = 0.6      # 박스 앞 정지 거리 (m)
+BOX_BACK_OFFSET = 0.6        # 박스 뒤쪽으로 이동할 거리 (m)
 CHECKED_BOX_RADIUS = 1.0     # 이미 검사한 박스 반경 (m)
 YOLO_CONF_THRESHOLD = 0.75   # YOLO 신뢰도 임계값 (75%)
 TARGET_BOX_COUNT = 2         # 목표 박스 개수
@@ -501,12 +501,15 @@ def main():
                     if pose:
                         rx, ry, _ = pose
                         angle = math.atan2(by - ry, bx - rx)
-                        tx = bx - BOX_APPROACH_DIST * math.cos(angle)
-                        ty = by - BOX_APPROACH_DIST * math.sin(angle)
+
+                        # 박스 "뒤쪽"으로 오프셋 (로봇->박스 방향을 기준으로 박스 반대편)
+                        tx = bx + BOX_BACK_OFFSET * math.cos(angle)
+                        ty = by + BOX_BACK_OFFSET * math.sin(angle)
                         
-                        # 박스를 바라보는 orientation 계산
-                        qz = math.sin(angle / 2)
-                        qw = math.cos(angle / 2)
+                        # 박스를 향해 뒤에서 바라보도록 180도 회전
+                        face_box = angle + math.pi
+                        qz = math.sin(face_box / 2)
+                        qw = math.cos(face_box / 2)
                         
                         print(f"[APPROACH] 박스 접근 시작!")
                         print(f"  현재 위치: ({rx:.2f}, {ry:.2f})")
