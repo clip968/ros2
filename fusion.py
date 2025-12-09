@@ -9,12 +9,14 @@ import time
 from rclpy.node import Node
 from tf2_ros import Buffer, TransformListener
 from geometry_msgs.msg import TransformStamped
-from sensor_msgs.msg import LaserScan, CameraInfo, Image
+from sensor_msgs.msg import LaserScan, CameraInfo, Image, CompressedImage
 from std_msgs.msg import String # JSON 수신용
 from sklearn.cluster import DBSCAN
 from cv_bridge import CvBridge
 from std_msgs.msg import Float32MultiArray
+from geometry_msgs.msg import PoseStamped
 
+import tf_transformations
 
 class LidarCameraProjector(Node):
     def __init__(self):
@@ -28,18 +30,19 @@ class LidarCameraProjector(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        self.EPSILON = 0.1   # 클러스터를 형성할 최대 거리 (m)
-        self.MIN_POINTS = 15
+        self.EPSILON = 0.5   # 클러스터를 형성할 최대 거리 (m)
+        self.MIN_POINTS = 5
 
         # 발행자
         self.fusion_pub = self.create_publisher(Image, "/fusion", 10)
         self.fusion_box_pt_pub = self.create_publisher(Float32MultiArray, "/fusion_box_point", 10)
         self.filtered_scan_pub = self.create_publisher(LaserScan, "/filtered_scan", 10) # <-- 추가: 필터링된 스캔 발행
+        self.bbox_map_pub = self.create_publisher(PoseStamped, "/bbox_map", 10)
 
         # 토픽 구독/발행
         self.sub_scan = self.create_subscription(LaserScan, "/scan", self.cb_scan, 10)
         self.sub_cam  = self.create_subscription(CameraInfo, "/oakd/rgb/preview/camera_info", self.cb_camera, 10)
-        self.sub_img  = self.create_subscription(Image, "/yolo_result", self.cb_image, 10) # yolo_test1.py의 결과 이미지 토픽으로 변경
+        self.sub_img  = self.create_subscription(CompressedImage, "/yolo_result", self.cb_image, 10) # yolo_test1.py의 결과 이미지 토픽으로 변경
         self.sub_yolo = self.create_subscription(String, "/yolo_detections", self.cb_yolo_detections, 10) # <-- 추가: YOLO JSON 수신
 
         # Intrinsic / Distortion / Image 저장 버퍼
@@ -66,7 +69,7 @@ class LidarCameraProjector(Node):
                 self.last_bbox_time = time.time()
             else:
                 self.last_bbox_time = 0.0
-            print(self.latest_bboxes)
+            # print(self.latest_bboxes)
         except json.JSONDecodeError:
             self.get_logger().warn("JSON 파싱 실패")
             self.latest_bboxes = []
@@ -77,16 +80,10 @@ class LidarCameraProjector(Node):
         t = tf.transform.translation
         q = tf.transform.rotation
 
-        x, y, z, w = q.x, q.y, q.z, q.w
+        # quaternion to 4×4 matrix
+        T = tf_transformations.quaternion_matrix([q.x, q.y, q.z, q.w])
 
-        R = np.array([
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w),         2 * (x * z + y * w)],
-            [2 * (x * y + z * w),     1 - 2 * (x * x + z * z),     2 * (y * z - x * w)],
-            [2 * (x * z - y * w),     2 * (y * z + x * w),         1 - 2 * (x * x + y * y)]
-        ])
-
-        T = np.eye(4)
-        T[:3, :3] = R
+        # translation 추가
         T[0, 3] = t.x
         T[1, 3] = t.y
         T[2, 3] = t.z
@@ -97,9 +94,9 @@ class LidarCameraProjector(Node):
         self.K = np.array(msg.k).reshape(3,3)
         self.D = np.array(msg.d)
         
-    def cb_image(self, msg: Image):
+    def cb_image(self, msg: CompressedImage):
         """이미지 저장"""
-        cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        cv_img = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
         # self.latest_image = cv_img.copy()
 
         """scan 점을 camera image에 투영"""
@@ -116,19 +113,32 @@ class LidarCameraProjector(Node):
             return
 
         T_lidar_cam = self.tf_to_matrix(tf)  # 4×4
+        # self.get_logger().info(f"Transformation matrix (lidar to camera):\n{T_lidar_cam}")
 
         # 2) 2D LiDAR scan → 3D points (라이다 좌표계) & 인덱스 저장
-        pts_lidar = [] # [x, y, z, r, index]
-        angle = self.latest_scan.angle_min
-        for i, r in enumerate(self.latest_scan.ranges):
-            if np.isfinite(r):
-                x = r * np.cos(angle)
-                y = r * np.sin(angle)
-                z = 0.0
-                pts_lidar.append([x,y,z,r,i])  # r(dist), i(original index)도 저장
-            angle += self.latest_scan.angle_increment
-        
-        pts_lidar = np.array(pts_lidar)
+        # LiDAR ranges → numpy array
+        ranges = np.array(self.latest_scan.ranges, dtype=np.float32)
+        num = len(ranges)
+
+        # 각도 배열 만들기
+        angles = self.latest_scan.angle_min + \
+                np.arange(num) * self.latest_scan.angle_increment
+
+        # 유효 range mask
+        valid_mask = np.isfinite(ranges) & (ranges < 5.0)
+
+        # 필터링된 데이터
+        r_valid = ranges[valid_mask]              # 거리
+        a_valid = angles[valid_mask]              # 각도
+        idx_valid = np.nonzero(valid_mask)[0]     # 원본 index
+
+        # 2D → 3D
+        x = r_valid * np.cos(a_valid)
+        y = r_valid * np.sin(a_valid)
+        z = np.zeros_like(x)
+
+        # 최종 스택: [x, y, z, r, idx]
+        pts_lidar = np.column_stack((x, y, z, r_valid, idx_valid))
 
         if len(pts_lidar) == 0:
             return
@@ -203,10 +213,10 @@ class LidarCameraProjector(Node):
 
         # 7) 필터링된 스캔 발행
         if self.latest_bboxes:
-            self.get_logger().info(f"BBox 내 LiDAR 점 감지: {bbox_hits}개")
+            # self.get_logger().info(f"BBox 내 LiDAR 점 감지: {bbox_hits}개")
             
             if bbox_hits == 0:
-                self.get_logger().info("BBox 있지만 LiDAR 히트 0 → 발행/클러스터 건너뜀")
+                # self.get_logger().info("BBox 있지만 LiDAR 히트 0 → 발행/클러스터 건너뜀")
                 # 더 이상 재사용되지 않도록 BBox 비우기
                 self.latest_bboxes = []
                 self.last_bbox_time = 0.0
@@ -245,7 +255,8 @@ class LidarCameraProjector(Node):
         try:
             # 라이다 프레임 → map 프레임 TF 조회
             tf = self.tf_buffer.lookup_transform('map', self.frame_lidar, rclpy.time.Time())
-            
+        
+
             # 변환 행렬 생성
             T = self.tf_to_matrix(tf)
             
@@ -257,7 +268,7 @@ class LidarCameraProjector(Node):
             
             return float(pt_map[0]), float(pt_map[1])
         except Exception as e:
-            self.get_logger().warn(f"라이다→map 변환 실패: {e}")
+            # self.get_logger().warn(f"라이다→map 변환 실패: {e}")
             return None
 
     def clustering(self, filtered_scan: LaserScan):
@@ -282,6 +293,7 @@ class LidarCameraProjector(Node):
         db = DBSCAN(eps=self.EPSILON, min_samples=self.MIN_POINTS).fit(X)
         labels = db.labels_
 
+        self.get_logger().info(f"클러스터 라벨: {np.unique(labels)}")
         if 0 in labels:
             cluster_0_mask = (labels == 0)
             cluster_0_points = X[cluster_0_mask]
@@ -303,13 +315,32 @@ class LidarCameraProjector(Node):
                 fusion_box_pt = Float32MultiArray()
                 fusion_box_pt.data = [map_x, map_y]
                 self.fusion_box_pt_pub.publish(fusion_box_pt)
+
+
+                # PoseStamped 메시지로도 발행
+                pose_msg = PoseStamped()
+                pose_msg.header.frame_id = 'map'
+                pose_msg.header.stamp = filtered_scan.header.stamp
+                
+                pose_msg.pose.position.x = map_x
+                pose_msg.pose.position.y = map_y
+                pose_msg.pose.position.z = 0.0
+                
+                pose_msg.pose.orientation.x = 0.0
+                pose_msg.pose.orientation.y = 0.0
+                pose_msg.pose.orientation.z = 0.0
+                pose_msg.pose.orientation.w = 1.0
+                
+                self.bbox_map_pub.publish(pose_msg)
+                
             else:
                 self.get_logger().warn(f"박스 감지했으나 좌표 변환 실패")
+                pass
 
         else:
-            self.get_logger().info("박스 클러스터 없음")
+            # self.get_logger().info("박스 클러스터 없음")
+            pass
 
-        self.get_logger().info(f"클러스터 라벨: {np.unique(labels)}")
 
     def cb_scan(self, msg: LaserScan):
         self.latest_scan = msg
