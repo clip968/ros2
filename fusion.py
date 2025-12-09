@@ -5,6 +5,7 @@ import rclpy
 import numpy as np
 import json
 import math
+import time
 from rclpy.node import Node
 from tf2_ros import Buffer, TransformListener
 from geometry_msgs.msg import TransformStamped
@@ -51,6 +52,7 @@ class LidarCameraProjector(Node):
 
         # YOLO 감지 정보 버퍼
         self.latest_bboxes = [] # [{'box': [x1, y1, x2, y2], 'name': 'box', ...}, ...]
+        self.last_bbox_time = 0.0  # 최근 bbox 수신 시각
 
     def cb_yolo_detections(self, msg: String):
         """YOLO 감지 결과를 JSON으로 수신"""
@@ -60,10 +62,15 @@ class LidarCameraProjector(Node):
             # 이 노드에서는 raw det_pub을 구독하는 것이 더 정확할 수 있으나,
             # 여기서는 yolo_test1.py의 /yolo_detections 토픽 (평균화)을 구독한다고 가정합니다.
             self.latest_bboxes = [det for det in detections if det.get('name', '').lower() == 'box'] # 박스만 필터링
+            if self.latest_bboxes:
+                self.last_bbox_time = time.time()
+            else:
+                self.last_bbox_time = 0.0
             print(self.latest_bboxes)
         except json.JSONDecodeError:
             self.get_logger().warn("JSON 파싱 실패")
             self.latest_bboxes = []
+            self.last_bbox_time = 0.0
     
     def tf_to_matrix(self, tf: TransformStamped):
         """TransformStamped → 4×4 변환 행렬"""
@@ -156,7 +163,10 @@ class LidarCameraProjector(Node):
         bbox_hits = 0
 
         # BBox 정보 (x1, y1, x2, y2)
-        if not self.latest_bboxes:
+        # 오래된 감지는 무시 (예: 0.6초 초과)
+        if (not self.latest_bboxes) or (time.time() - self.last_bbox_time > 0.6):
+            self.latest_bboxes = []
+            self.last_bbox_time = 0.0
             # BBox 정보가 없으면, 퓨전 이미지만 발행하고 필터링 스캔은 건너뜀
             pass 
         else:
@@ -197,6 +207,9 @@ class LidarCameraProjector(Node):
             
             if bbox_hits == 0:
                 self.get_logger().info("BBox 있지만 LiDAR 히트 0 → 발행/클러스터 건너뜀")
+                # 더 이상 재사용되지 않도록 BBox 비우기
+                self.latest_bboxes = []
+                self.last_bbox_time = 0.0
                 return
 
             filtered_msg = LaserScan()

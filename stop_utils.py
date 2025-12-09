@@ -26,10 +26,11 @@ class CmdStopper:
         msg.angular.z = 0.0
         self.publisher.publish(msg)
 
-    def stop_now(self, duration_sec=0.5):
+    def stop_now(self, duration_sec=0.3):
         """
         즉시 정지 명령을 duration_sec 동안 연속 발행.
         Nav2/타 노드의 cmd_vel을 덮어쓰고, 필요 시 spin_once로 콜백도 돌림.
+        ※ 네트워크 부하 감소를 위해 기본값 0.3초, 간격 30ms로 조정
         """
         end_time = time.time() + duration_sec
         self.force_stop_until = max(self.force_stop_until, end_time)
@@ -37,7 +38,7 @@ class CmdStopper:
             self._publish_zero()
             if self.spin_node:
                 rclpy.spin_once(self.spin_node, timeout_sec=0.0)
-            time.sleep(0.02)  # 20ms 간격
+            time.sleep(0.03)  # 30ms 간격 (부하 감소)
 
     def enforce_stop(self):
         """

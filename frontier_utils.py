@@ -16,16 +16,35 @@ def grid_to_world(map_info, gx, gy):
     return ox + gx * res, oy + gy * res
 
 
-def find_safe_point(map_data, cx, cy):
-    """주변 5픽셀 내에서 가장 안전한 Free 공간 찾기"""
+def is_safe_cell(map_data, r, c, safe_margin=3):
+    """해당 셀 주변 safe_margin 픽셀 내에 장애물(100)이 없는지 확인"""
     rows, cols = map_data.shape
-    for r in range(max(0, cy - 5), min(rows, cy + 6)):
-        for c in range(max(0, cx - 5), min(cols, cx + 6)):
-            if map_data[r, c] == 0:
-                # 너무 가까운(경계선) 곳은 피함 (2픽셀 이상)
-                if abs(r - cy) + abs(c - cx) > 2:
-                    return c, r  # (x, y)
-    return None
+    for dr in range(-safe_margin, safe_margin + 1):
+        for dc in range(-safe_margin, safe_margin + 1):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols:
+                if map_data[nr, nc] == 100:  # 장애물
+                    return False
+    return True
+
+def find_safe_point(map_data, cx, cy):
+    """주변 10픽셀 내에서 장애물로부터 충분히 떨어진 Free 공간 찾기"""
+    rows, cols = map_data.shape
+    best_pt = None
+    best_dist = 0
+    
+    # 더 넓은 범위 탐색 (5 -> 10픽셀)
+    for r in range(max(0, cy - 10), min(rows, cy + 11)):
+        for c in range(max(0, cx - 10), min(cols, cx + 11)):
+            if map_data[r, c] == 0:  # Free cell
+                # 장애물과 최소 3픽셀 이상 떨어져야 함
+                if is_safe_cell(map_data, r, c, safe_margin=3):
+                    dist = abs(r - cy) + abs(c - cx)
+                    if dist > 3 and dist > best_dist:  # 경계선에서 떨어짐
+                        best_dist = dist
+                        best_pt = (c, r)
+    
+    return best_pt
 
 
 def compute_frontier_goal(map_data, map_info, last_goal=None):

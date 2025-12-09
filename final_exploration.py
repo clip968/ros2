@@ -30,10 +30,13 @@ from frontier_utils import compute_frontier_goal
 
 # ================= [설정] =================
 BOX_CLASS_NAME = "box"       # YOLO 클래스 이름 (모델에 맞게 수정)
-BOX_BACK_OFFSET = 0.6        # 박스 뒤쪽으로 이동할 거리 (m)
+BOX_DEPTH = 0.3              # 박스 깊이 추정 (m) - 박스를 통과하기 위한 값
+BOX_BEHIND_OFFSET = 0.5      # 박스 뒤쪽에서 떨어질 거리 (m)
 CHECKED_BOX_RADIUS = 1.0     # 이미 검사한 박스 반경 (m)
 YOLO_CONF_THRESHOLD = 0.75   # YOLO 신뢰도 임계값 (75%)
 TARGET_BOX_COUNT = 2         # 목표 박스 개수
+BOX_MEASURE_COUNT = 5        # 박스 좌표 측정 횟수 (중간값용)
+BOX_MEASURE_INTERVAL = 0.3   # 측정 간격 (초)
 # ==========================================
 
 
@@ -78,6 +81,10 @@ class FinalExplorer(Node):
         # 7. 퓨전 박스 위치 (월드 좌표)
         self.fusion_box_world = None  # (x, y) - 월드 좌표 (map 프레임)
         self.fusion_box_timestamp = None  # 수신 시간
+        
+        # 8. 박스 측정 버퍼 (여러 번 측정용)
+        self.box_measurements = []  # [(x, y), ...]
+        self.measuring_box = False  # 측정 중 플래그
         
         # 8. TF (위치 추적용)
         self.tf_buffer = Buffer()
@@ -158,56 +165,85 @@ class FinalExplorer(Node):
         
         self.get_logger().info(f"✅ 박스 감지됨: conf={best_box.get('conf'):.2f}, angle={best_box.get('angle_deg'):.1f}deg")
         
-        # 이미 접근 중이면 무시
+        # 이미 접근 중이거나 측정 중이면 무시
         if self.mode == "APPROACH":
             self.get_logger().info("이미 APPROACH 모드 - 무시")
             return
         
-        # === 박스 위치 추정 (퓨전 우선, 없으면 기존 방식) ===
-        box_pos = None
+        if self.measuring_box:
+            # 측정 중일 때는 좌표만 수집
+            box_pos = self._get_current_box_pos(best_box)
+            if box_pos:
+                self.box_measurements.append(box_pos)
+                self.get_logger().info(f"📏 측정 {len(self.box_measurements)}/{BOX_MEASURE_COUNT}: ({box_pos[0]:.2f}, {box_pos[1]:.2f})")
+            return
         
-        # 1. 퓨전 데이터가 최근 것이면 사용 (1초 이내)
+        # === 첫 박스 발견 -> 멈추고 측정 모드 시작! ===
+        self.get_logger().info(f"🎯 박스 발견! 정지 후 좌표 측정 시작...")
+        
+        # 1. Nav2 취소 + 정지
+        self.cancel_nav()
+        self.stop_robot(0.5)
+        
+        # 2. 측정 모드 시작
+        self.measuring_box = True
+        self.box_measurements = []
+        
+        # 3. 여러 번 측정 (정지 상태에서)
+        for i in range(BOX_MEASURE_COUNT):
+            # 콜백 처리 (fusion 데이터 수신)
+            for _ in range(3):  # 0.3초 동안 spin
+                rclpy.spin_once(self, timeout_sec=0.1)
+            
+            # 현재 좌표 측정
+            box_pos = self._get_current_box_pos(best_box)
+            if box_pos:
+                self.box_measurements.append(box_pos)
+                self.get_logger().info(f"📏 측정 {len(self.box_measurements)}/{BOX_MEASURE_COUNT}: ({box_pos[0]:.2f}, {box_pos[1]:.2f})")
+            
+            time.sleep(BOX_MEASURE_INTERVAL)
+        
+        self.measuring_box = False
+        
+        # 4. 측정값이 충분하면 중간값 계산
+        if len(self.box_measurements) < 2:
+            self.get_logger().error("❌ 측정 데이터 부족!")
+            return
+        
+        # 중간값 계산 (median)
+        xs = sorted([p[0] for p in self.box_measurements])
+        ys = sorted([p[1] for p in self.box_measurements])
+        median_x = xs[len(xs) // 2]
+        median_y = ys[len(ys) // 2]
+        final_pos = (median_x, median_y)
+        
+        self.get_logger().info(f"📍 최종 좌표 (중간값): ({median_x:.2f}, {median_y:.2f})")
+        
+        if self.is_checked_box(*final_pos):
+            self.get_logger().info("이미 확인한 박스 - 무시")
+            return
+        
+        # 5. APPROACH 모드로 전환
+        self.box_detected = True
+        self.current_box_pos = final_pos
+        self.mode = "APPROACH"
+    
+    def _get_current_box_pos(self, detection):
+        """현재 박스 좌표 얻기 (퓨전 우선)"""
+        # 퓨전 데이터가 최근 것이면 사용
         if self.fusion_box_world and self.fusion_box_timestamp:
             age = time.time() - self.fusion_box_timestamp
             if age < 1.0:
-                box_pos = self.fusion_box_world  # 이미 월드 좌표!
-                self.get_logger().info(f"📍 퓨전 기반 박스 위치 사용 (age={age:.2f}s)")
+                return self.fusion_box_world
         
-        # 2. 퓨전 데이터 없으면 기존 방식 (각도 + 라이다)
-        if not box_pos:
-            self.get_logger().info("📍 기존 방식 (YOLO 각도 + 라이다) 사용")
-            box_pos = self.estimate_box_position(best_box)
-        
-        if not box_pos:
-            self.get_logger().error("❌ 박스 위치 추정 실패!")
-            return
-        
-        if self.is_checked_box(*box_pos):
-            self.get_logger().info("이미 확인한 박스 - 무시")
-            return  # 이미 간 박스는 무시
-        
-        # === 박스 발견 -> 멈추고 위치 저장 -> Nav2 APPROACH 모드! ===
-        self.get_logger().info(f"박스 발견! 위치=({box_pos[0]:.2f}, {box_pos[1]:.2f}), 거리={self.front_distance:.2f}m")
-        
-        # 1. Nav2 취소
-        self.cancel_nav()
-        
-        # 2. 정지 명령 (여러 번)
-        self.stop_robot()
-        
-        # 3. 잠시 대기 (정지 확인)
-        time.sleep(0.3)
-        self.stop_robot()  # 한 번 더
-        
-        self.box_detected = True
-        self.current_box_pos = box_pos
-        self.mode = "APPROACH"
+        # 없으면 기존 방식
+        return self.estimate_box_position(detection)
 
     # ===== 유틸리티 =====
     def get_robot_pose(self):
         try:
-            # TF 도착 대기 (최대 0.5초)
-            if not self.tf_buffer.can_transform('map', 'base_link', rclpy.time.Time(), timeout=Duration(seconds=0.5)):
+            # TF 도착 대기 (최대 0.1초로 단축 - 네트워크 부하 감소)
+            if not self.tf_buffer.can_transform('map', 'base_link', rclpy.time.Time(), timeout=Duration(seconds=0.1)):
                 return None
             t = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
             q = t.transform.rotation
@@ -343,11 +379,11 @@ class FinalExplorer(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
             time.sleep(0.05)  # CPU 과부하 방지
 
-    def rotate_scan(self, duration_sec=8.0, angular_speed=0.5):
+    def rotate_scan(self, duration_sec=10.0, angular_speed=0.3):
         """
         제자리에서 회전하며 YOLO로 박스 스캔
-        - duration_sec: 회전 시간 (8초 ≈ 360도 at 0.5 rad/s)
-        - angular_speed: 회전 속도 (rad/s)
+        - duration_sec: 회전 시간 (10초 ≈ 180도 at 0.3 rad/s)
+        - angular_speed: 회전 속도 (rad/s) - 낮을수록 천천히 회전
         - 박스 발견 시 즉시 중단하고 True 반환
         """
         self.get_logger().info(f"🔄 회전 스캔 시작 ({duration_sec}초)")
@@ -401,10 +437,10 @@ def main():
             if node.cancel_nav_requested:
                 nav.cancelTask()
                 node.cancel_nav_requested = False
-                # Nav2가 완전히 취소될 때까지 대기 (중요!)
-                time.sleep(0.3)
-                # 추가 정지 명령
-                node.stop_robot()
+                # Nav2가 완전히 취소될 때까지 대기 (짧게)
+                time.sleep(0.1)
+                # 정지 명령
+                node.stop_robot(0.2)
                 continue  # 이번 루프는 스킵하고 다음으로
             
             # === Nav2 접근 모드 (APPROACH) ===
@@ -418,28 +454,26 @@ def main():
                 if not node.is_navigating:
                     bx, by = node.current_box_pos
                     
-                    # 박스 앞 목표 지점 계산
+                    # 박스 뒤 목표 지점 계산
                     pose = node.get_robot_pose()
                     if pose:
                         rx, ry, _ = pose
                         angle = math.atan2(by - ry, bx - rx)
 
-                        # 박스 "뒤쪽"으로 오프셋 (로봇->박스 방향을 기준으로 박스 반대편)
-                        tx = bx + BOX_BACK_OFFSET * math.cos(angle)
-                        ty = by + BOX_BACK_OFFSET * math.sin(angle)
+                        # 박스 "뒤"로 이동: 박스를 통과해서 뒤쪽에 목표 설정
+                        # Nav2가 costmap에서 박스를 피해 우회 경로를 찾음
+                        tx = bx + (BOX_DEPTH + BOX_BEHIND_OFFSET) * math.cos(angle)
+                        ty = by + (BOX_DEPTH + BOX_BEHIND_OFFSET) * math.sin(angle)
                         
-                        # 박스를 향해 뒤에서 바라보도록 180도 회전
-                        face_box = angle + math.pi
-                        qz = math.sin(face_box / 2)
-                        qw = math.cos(face_box / 2)
+                        # 박스를 바라보도록 (뒤에서 앞을 봄 = 반대 방향)
+                        face_angle = angle + math.pi
+                        qz = math.sin(face_angle / 2)
+                        qw = math.cos(face_angle / 2)
                         
-                        print(f"[APPROACH] 박스 접근 시작!")
+                        print(f"[APPROACH] 박스 뒤로 접근 시작!")
                         print(f"  현재 위치: ({rx:.2f}, {ry:.2f})")
-                        print(f"  박스 위치: ({bx:.2f}, {by:.2f})")
-                        print(f"  목표 위치: ({tx:.2f}, {ty:.2f})")
-                        
-                        # Nav2 goal 설정 전 잠시 대기
-                        time.sleep(0.2)
+                        print(f"  박스 앞면: ({bx:.2f}, {by:.2f})")
+                        print(f"  목표 (박스 뒤): ({tx:.2f}, {ty:.2f})")
                         
                         goal = PoseStamped()
                         goal.header.frame_id = 'map'
@@ -515,19 +549,21 @@ def main():
                         node.wait_with_spin(2.0)  # spin 유지하면서 대기
                 
                 elif nav.isTaskComplete():
-                    # 성공이든 실패든 다음 목표 찾기
                     result = nav.getResult()
-                    if result != TaskResult.SUCCEEDED:
-                        print(f"탐사 목표 도달 실패: {result}")
                     node.is_navigating = False
                     
-                    # 🔄 Frontier 도착 후 회전 스캔 (박스 찾기)
-                    if node.mode == "EXPLORE":  # APPROACH로 전환 안 됐으면
-                        print("🔄 주변 박스 스캔 시작...")
-                        found = node.rotate_scan(duration_sec=6.0, angular_speed=0.6)
-                        if found:
-                            print("박스 발견! APPROACH 모드로 전환됨")
-                            continue
+                    if result == TaskResult.SUCCEEDED:
+                        print("탐사 목표 도착!")
+                        # 🔄 성공 시에만 회전 스캔 (박스 찾기)
+                        if node.mode == "EXPLORE":
+                            print("🔄 주변 박스 스캔 시작...")
+                            found = node.rotate_scan(duration_sec=10.0, angular_speed=0.3)
+                            if found:
+                                print("박스 발견! APPROACH 모드로 전환됨")
+                                continue
+                    else:
+                        # 실패 시 바로 다음 목표로 (회전 스캔 생략)
+                        print(f"탐사 목표 도달 실패: {result} → 다음 목표로")
 
     except KeyboardInterrupt:
         print("\n사용자 종료")
