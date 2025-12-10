@@ -10,7 +10,7 @@ YOLO PT 모델 노드 (탐사 노드 연동)
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from std_msgs.msg import String
 from cv_bridge import CvBridge
 from ultralytics import YOLO
@@ -22,10 +22,10 @@ import math
 
 # ================= [설정] =================
 MODEL_PATH = "yolov11_best.pt"
-CAMERA_TOPIC = "/oakd/rgb/preview/image_raw"
+CAMERA_TOPIC = "/oakd/rgb/preview/image_raw/compressed"
 
 # 목표 FPS (10~15 사이 추천)
-TARGET_FPS = 12
+TARGET_FPS = 15
 
 # 이미지 크기
 IMG_SIZE = 320
@@ -37,7 +37,7 @@ CAMERA_HFOV_DEG = 69.0
 CONF_THRESHOLD = 0.75
 
 # 박스 좌표 평균화 설정
-BOX_BUFFER_SIZE = 5  # 몇 개 모아서 평균 낼지 (15 -> 5로 축소: 로봇 이동 중 오차 감소)
+BOX_BUFFER_SIZE = 1  # 몇 개 모아서 평균 낼지 (15 -> 5로 축소: 로봇 이동 중 오차 감소)
 # ==========================================
 
 
@@ -54,11 +54,11 @@ class Yolo11Node(Node):
         
         # 카메라 구독
         self.sub = self.create_subscription(
-            Image, CAMERA_TOPIC, self.image_callback, qos
+            CompressedImage, CAMERA_TOPIC, self.image_callback, qos
         )
         
         # 결과 발행 (이미지)
-        self.pub = self.create_publisher(Image, '/yolo_result', 10)
+        self.pub = self.create_publisher(CompressedImage, '/yolo_result', 10)
         
         # 감지 결과 발행 (JSON) - 다른 노드에서 구독 가능
         self.det_pub = self.create_publisher(String, '/yolo_detections', 10)
@@ -94,7 +94,7 @@ class Yolo11Node(Node):
     def image_callback(self, msg):
         """카메라 프레임 저장 (최신 것만)"""
         try:
-            self.latest_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            self.latest_frame = self.bridge.compressed_imgmsg_to_cv2(msg)
         except Exception as e:
             self.get_logger().error(f"이미지 변환 에러: {e}")
 
@@ -228,7 +228,7 @@ class Yolo11Node(Node):
             cv2.putText(frame, info, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
             # 발행
-            out_msg = self.bridge.cv2_to_imgmsg(frame, "bgr8")
+            out_msg = self.bridge.cv2_to_compressed_imgmsg(frame)
             self.pub.publish(out_msg)
             
         except Exception as e:
