@@ -62,7 +62,8 @@ class LidarCameraProjector(Node):
         # 큐 크기 10, slop 0.1초 (필요시 조정)
         self.ts = message_filters.ApproximateTimeSynchronizer(
             [self.sub_scan, self.sub_yolo, self.sub_cam], 
-            queue_size=10, slop=0.05
+            queue_size=10, slop=0.05,
+            allow_headerless=True
         )
         self.ts.registerCallback(self.cb_sync)
 
@@ -151,7 +152,7 @@ class LidarCameraProjector(Node):
         indices_valid_z = indices[valid_z]
 
         # 필터링 결과 버퍼
-        filtered_ranges = [float('inf')] * num
+        filtered_ranges = np.array([float('inf')] * num)
 
         bbox_msg = PoseArray()
         bbox_msg.header.stamp = scan_msg.header.stamp
