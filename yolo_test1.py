@@ -25,7 +25,7 @@ MODEL_PATH = "yolov11_best.pt"
 CAMERA_TOPIC = "/oakd/rgb/preview/image_raw/compressed"
 
 # 목표 FPS (10~15 사이 추천)
-TARGET_FPS = 30
+TARGET_FPS = 15
 
 # 이미지 크기
 IMG_SIZE = 320
@@ -37,7 +37,7 @@ CAMERA_HFOV_DEG = 69.0
 CONF_THRESHOLD = 0.75
 
 # 박스 좌표 평균화 설정
-BOX_BUFFER_SIZE = 5  # 몇 개 모아서 평균 낼지 (15 -> 5로 축소: 로봇 이동 중 오차 감소)
+BOX_BUFFER_SIZE = 1  # 몇 개 모아서 평균 낼지 (15 -> 5로 축소: 로봇 이동 중 오차 감소)
 # ==========================================
 
 

@@ -47,9 +47,12 @@ def find_safe_point(map_data, cx, cy):
     return best_pt
 
 
-def compute_frontier_goal(map_data, map_info, last_goal=None):
+def compute_frontier_goal(map_data, map_info, last_goal=None, robot_pose=None, 
+                          min_dist=2.0, max_dist=3.0):
     """
     Frontier 기반 탐사 목표 계산
+    - robot_pose: (x, y, yaw) 로봇 현재 위치
+    - min_dist, max_dist: 목표 거리 범위 (2~3m 사이로 짧게 짧게)
     반환: (wx, wy) 또는 None
     """
     if map_data is None or map_info is None:
@@ -67,6 +70,11 @@ def compute_frontier_goal(map_data, map_info, last_goal=None):
     if not contours:
         return None
 
+    # 로봇 위치 추출
+    robot_x, robot_y = None, None
+    if robot_pose:
+        robot_x, robot_y = robot_pose[0], robot_pose[1]
+
     candidates = []
     for cnt in contours:
         if len(cnt) < 5:
@@ -83,6 +91,23 @@ def compute_frontier_goal(map_data, map_info, last_goal=None):
             continue
 
         wx, wy = grid_to_world(map_info, *safe_pt)
+
+        # 로봇에서 목표까지 거리 계산
+        if robot_x is not None:
+            dist_to_robot = math.hypot(wx - robot_x, wy - robot_y)
+            
+            # 거리가 max_dist를 초과하면 로봇에서 max_dist 지점으로 중간 목표 설정
+            if dist_to_robot > max_dist:
+                # 로봇→목표 방향으로 max_dist만큼 떨어진 지점 계산
+                angle = math.atan2(wy - robot_y, wx - robot_x)
+                target_dist = (min_dist + max_dist) / 2  # 2.5m (중간값)
+                wx = robot_x + target_dist * math.cos(angle)
+                wy = robot_y + target_dist * math.sin(angle)
+                dist_to_robot = target_dist
+            
+            # 너무 가까운 목표는 스킵 (min_dist 미만)
+            if dist_to_robot < min_dist:
+                continue
 
         score = len(cnt)
         if last_goal:

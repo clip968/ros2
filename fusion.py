@@ -16,7 +16,23 @@ from cv_bridge import CvBridge
 from std_msgs.msg import Float32MultiArray
 from geometry_msgs.msg import PoseStamped
 
-import tf_transformations
+
+def quaternion_to_matrix(q):
+    """쿼터니언 [x, y, z, w] → 4x4 변환 행렬 (tf_transformations 대체)"""
+    x, y, z, w = q
+    
+    # 회전 행렬 계산
+    R = np.array([
+        [1 - 2*(y*y + z*z),     2*(x*y - z*w),     2*(x*z + y*w)],
+        [    2*(x*y + z*w), 1 - 2*(x*x + z*z),     2*(y*z - x*w)],
+        [    2*(x*z - y*w),     2*(y*z + x*w), 1 - 2*(x*x + y*y)]
+    ])
+    
+    # 4x4 행렬로 확장
+    T = np.eye(4)
+    T[:3, :3] = R
+    return T
+
 
 class LidarCameraProjector(Node):
     def __init__(self):
@@ -41,9 +57,10 @@ class LidarCameraProjector(Node):
 
         # 토픽 구독/발행
         self.sub_scan = self.create_subscription(LaserScan, "/scan", self.cb_scan, 10)
-        self.sub_cam  = self.create_subscription(CameraInfo, "/oakd/rgb/preview/camera_info", self.cb_camera, 10)
-        self.sub_img  = self.create_subscription(CompressedImage, "/yolo_result", self.cb_image, 10) # yolo_test1.py의 결과 이미지 토픽으로 변경
         self.sub_yolo = self.create_subscription(String, "/yolo_detections", self.cb_yolo_detections, 10) # <-- 추가: YOLO JSON 수신
+        self.sub_cam  = self.create_subscription(CameraInfo, "/oakd/rgb/preview/camera_info", self.cb_camera, 10)
+
+        self.sub_img  = self.create_subscription(CompressedImage, "/yolo_result", self.cb_image, 10) # yolo_test1.py의 결과 이미지 토픽으로 변경
 
         # Intrinsic / Distortion / Image 저장 버퍼
         self.K = None        # 3×3 intrinsic
@@ -80,8 +97,8 @@ class LidarCameraProjector(Node):
         t = tf.transform.translation
         q = tf.transform.rotation
 
-        # quaternion to 4×4 matrix
-        T = tf_transformations.quaternion_matrix([q.x, q.y, q.z, q.w])
+        # quaternion to 4×4 matrix (직접 계산)
+        T = quaternion_to_matrix([q.x, q.y, q.z, q.w])
 
         # translation 추가
         T[0, 3] = t.x

@@ -34,7 +34,7 @@ from frontier_utils import compute_frontier_goal
 # ================= [설정] =================
 BOX_CLASS_NAME = "box"       # YOLO 클래스 이름 (모델에 맞게 수정)
 BOX_DEPTH = 0.3              # 박스 깊이 추정 (m) - 박스를 통과하기 위한 값
-BOX_BEHIND_OFFSET = 0.5      # 박스 뒤쪽에서 떨어질 거리 (m)
+BOX_BEHIND_OFFSET = 0.3    # 박스 뒤쪽에서 떨어질 거리 (m)
 CHECKED_BOX_RADIUS = 1.0     # 이미 검사한 박스 반경 (m)
 YOLO_CONF_THRESHOLD = 0.75   # YOLO 신뢰도 임계값 (75%)
 TARGET_BOX_COUNT = 2         # 목표 박스 개수
@@ -231,13 +231,13 @@ class FinalExplorerAsync(Node):
         """
         self.get_logger().info(f"🔄 회전 스캔 시작 ({duration_sec}초)")
         
-        for i in range(15):
+        for i in range(10):
             self.get_logger().info(f"========== step : {i} ==========")
             self.stop_robot(0.3)
 
             # 5초 동안 대기 (백그라운드에서 자동으로 콜백 실행됨!)
             self.get_logger().info("⏳ 5초 대기 중... (백그라운드 자동 수신)")
-            self.wait_async(5.0)
+            self.wait_async(1.0)
             
             # Thread-safe 데이터 읽기
             with self.data_lock:
@@ -257,13 +257,14 @@ class FinalExplorerAsync(Node):
                 fusion_age = time.time() - fusion_ts
                 self.get_logger().info(f"🎯 FUSION: 데이터 있음 ({fusion_age:.2f}초 전)")
                 print(f"Fusion timestamp 차이: {fusion_age}")
+
+                # 최근 1초 이내면 즉시 성공
+                if fusion_age < 1.0:
+                    self.stop_robot(0.1)
+                    return True
+            
             else:
                 self.get_logger().info("🎯 FUSION: 데이터 없음")
-
-            # fusion 데이터가 최근(1초 이내)이면 박스 발견으로 판정
-            if fusion_ts is not None and (time.time() - fusion_ts) < 1.0:
-                self.get_logger().info("✅ 회전 스캔 중 박스 발견! 스캔 중단")                
-                return True
 
             # 다음 스텝: 약간 회전
             target_angle = np.deg2rad(10)
@@ -274,11 +275,11 @@ class FinalExplorerAsync(Node):
             self.get_logger().info(f"🔄 {np.rad2deg(target_angle):.1f}도 회전 시작...")
             while time.time() < end_rot_time and rclpy.ok():
                 # 회전 명령 퍼블리시
-                self.publish_cmd_vel(0.0, np.sign(target_angle) * angular_speed)
+                self.nav.spin(np.deg2rad(10))
                 time.sleep(0.05)
             
             # 회전 후 정지 펄스
-            self.publish_cmd_vel(0.0, 0.0)
+            self.stop_robot(0.5)
         
         # 회전 완료 후 정지
         self.stop_robot()
@@ -355,7 +356,7 @@ def main():
                         node.nav.goToPose(goal)
                         print(f"[APPROACH] Nav2 goal 전송 완료!")
 
-                        node.nav.cancelTask()
+                        # 목표 지점 디버깅용 퍼블리시 (cancelTask 제거!)
                         node.target_point_pub.publish(goal)
 
                         node.is_navigating = True
@@ -369,7 +370,7 @@ def main():
                     result = node.nav.getResult()
                     if result == TaskResult.SUCCEEDED:
                         print('도착착!!!!!')
-                        break
+                        # break
 
                         is_final_box = (len(node.checked_boxes) + 1) >= TARGET_BOX_COUNT
                         if is_final_box:
@@ -408,7 +409,11 @@ def main():
                         map_info = node.map_info
                         last_goal = node.last_goal
                     
-                    target = compute_frontier_goal(map_data, map_info, last_goal)
+                    # 로봇 현재 위치 가져오기 (2~3m 거리 제한용)
+                    robot_pose = node.get_robot_pose()
+                    target = compute_frontier_goal(map_data, map_info, last_goal, 
+                                                   robot_pose=robot_pose, 
+                                                   min_dist=2.0, max_dist=3.0)
                     if target:
                         tx, ty = target
                         print(f"\n탐사 목표: ({tx:.2f}, {ty:.2f})")
@@ -437,9 +442,9 @@ def main():
                         found = node.rotate_scan(duration_sec=10.0, angular_speed=0.16)
                         if found:
                             print("박스 발견! APPROACH 모드로 전환됨")
-                            node.mode = "APPROACH"
                             with node.data_lock:
                                 node.current_box_pos = node.fusion_box_world
+                            node.mode = "APPROACH"
 
                     else:
                         # 실패 시 바로 다음 목표로 (회전 스캔 생략)
