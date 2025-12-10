@@ -17,8 +17,8 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import PoseStamped, Quaternion, Twist
-from std_msgs.msg import String, Float32MultiArray
+from geometry_msgs.msg import Pose, PoseArray, PoseStamped, Quaternion, Twist
+from std_msgs.msg import String
 from visualization_msgs.msg import Marker
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 from tf2_ros import Buffer, TransformListener
@@ -59,7 +59,7 @@ class FinalExplorerAsync(Node):
             callback_group=self.callback_group
         )
         self.create_subscription(
-            Float32MultiArray, '/fusion_box_point', self.fusion_callback, 10,
+            PoseArray, '/fusion_box_point', self.fusion_callback, 10,
             callback_group=self.callback_group
         )
         self.create_subscription(
@@ -130,20 +130,53 @@ class FinalExplorerAsync(Node):
         except:
             pass
 
-    def fusion_callback(self, msg):
+    def fusion_callback(self, msg: PoseArray):
         with self.data_lock:
             if self.mode == "APPROACH":
                 self.get_logger().info("이미 APPROACH 모드 - 무시")
                 return
 
-            self.get_logger().info('🎯 퓨전 데이터 수신!')
-            world_x, world_y = msg.data[0], msg.data[1]
-            self.fusion_box_world = (world_x, world_y)  # 월드 좌표로 저장
-            self.fusion_box_timestamp = time.time()
+            if len(msg.poses) == 0:
+                self.get_logger().info("공갈 메세지 수신")
+                return
+
+            self.get_logger().info('🎯 퓨전 박스 수신!')
+
+            self.fusion_box_world = None
+            self.fusion_box_timestamp = None
             
-            self.get_logger().info(
-                f"🎯 퓨전 박스 수신 (월드 좌표): ({world_x:.2f}, {world_y:.2f})"
-            )
+            # 로봇 현재 위치 가져오기
+            robot_pose = self.get_robot_pose()
+            if robot_pose is None:
+                self.get_logger().warn("@@@@@@@@@@@@@@@@ 로봇 위치 불명 - 첫 번째 유효 박스 선택")
+                rx, ry = 0.0, 0.0  # 폴백
+            else:
+                rx, ry, _ = robot_pose
+
+            closest_dist = float('inf')
+            
+            for pos in msg.poses:
+                box_pos = (pos.position.x, pos.position.y)
+                
+                if self.check_duplicate_box(box_pos):
+                    self.get_logger().warn("🚨 이미 방문한 박스 감지! -> 무시함")
+                    continue
+
+                # 로봇과 박스 간 거리 계산
+                dist_to_robot = math.hypot(box_pos[0] - rx, box_pos[1] - ry)
+                
+                if dist_to_robot < closest_dist:
+                    closest_dist = dist_to_robot
+                    self.fusion_box_world = box_pos
+
+            if self.fusion_box_world is not None:
+                self.fusion_box_timestamp = time.time()
+                self.get_logger().info(
+                    f"🎯 퓨전 박스 수신 (월드 좌표): ({self.fusion_box_world[0]:.2f}, {self.fusion_box_world[1]:.2f}), 거리: {closest_dist:.2f}m"
+                )
+            
+            else:
+                self.get_logger().info("🎯 퓨전 박스 수신 (월드 좌표): 없음")
 
     # ===== 유틸리티 =====
     def get_robot_pose(self):
@@ -220,6 +253,15 @@ class FinalExplorerAsync(Node):
         """
         time.sleep(duration_sec)
 
+    def check_duplicate_box(self, target_box_world):
+        tx, ty = target_box_world
+        for (cx, cy) in self.checked_boxes:
+            dist = math.hypot(tx - cx, ty - cy)
+            if dist < CHECKED_BOX_RADIUS:
+                return True
+
+        return False
+
     def rotate_scan(self, duration_sec=10.0, angular_speed=0.3):
         """
         제자리에서 회전하며 YOLO로 박스 스캔
@@ -233,10 +275,9 @@ class FinalExplorerAsync(Node):
         
         for i in range(10):
             self.get_logger().info(f"========== step : {i} ==========")
-            self.stop_robot(0.3)
-
-            # 5초 동안 대기 (백그라운드에서 자동으로 콜백 실행됨!)
-            self.get_logger().info("⏳ 5초 대기 중... (백그라운드 자동 수신)")
+            
+            # 1초 동안 대기 (백그라운드에서 자동으로 콜백 실행됨!)
+            self.get_logger().info("⏳ 1초 대기 중... (백그라운드 자동 수신)")
             self.wait_async(1.0)
             
             # Thread-safe 데이터 읽기
@@ -258,7 +299,7 @@ class FinalExplorerAsync(Node):
                 self.get_logger().info(f"🎯 FUSION: 데이터 있음 ({fusion_age:.2f}초 전)")
                 print(f"Fusion timestamp 차이: {fusion_age}")
 
-                # 최근 1초 이내면 즉시 성공
+                # 최근 1초 이내면 후보 확인
                 if fusion_age < 1.0:
                     self.stop_robot(0.1)
                     return True
@@ -276,7 +317,7 @@ class FinalExplorerAsync(Node):
             while time.time() < end_rot_time and rclpy.ok():
                 # 회전 명령 퍼블리시
                 self.nav.spin(np.deg2rad(10))
-                time.sleep(0.05)
+                time.sleep(0.1)
             
             # 회전 후 정지 펄스
             self.stop_robot(0.5)
