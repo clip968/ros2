@@ -43,13 +43,13 @@ controller_server:
       debug_trajectory_details: True
       min_vel_x: 0.0  # (아까 설정한 후진 금지)
       min_vel_y: 0.0
-      max_vel_x: 0.28       # 전진 속도 증가 (0.22 → 0.28)
+      max_vel_x: 0.5       # 전진 속도 증가 (0.22 → 0.28)
       max_vel_y: 0.0
       max_vel_theta: 0.8    # 회전 속도 유지
       min_speed_xy: 0.03
-      max_speed_xy: 0.28    # 최대 속도 증가
+      max_speed_xy: 0.5    # 최대 속도 증가
       min_speed_theta: 0.1
-      acc_lim_x: 1.5        # 가속도 감소 (더 부드럽게)
+      acc_lim_x: 2.0        # 가속도 감소 (더 부드럽게)
       acc_lim_y: 0.0
       acc_lim_theta: 2.0    # 회전 가속도 감소
       decel_lim_x: -1.5

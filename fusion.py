@@ -15,6 +15,8 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseArray, Pose, PoseStamped
 import message_filters
 
+from sklearn.cluster import DBSCAN
+
 def quaternion_to_matrix(q):
     """쿼터니언 [x, y, z, w] → 4x4 변환 행렬 (tf_transformations 대체)"""
     x, y, z, w = q
@@ -83,6 +85,8 @@ class LidarCameraProjector(Node):
         self.last_bbox_time = 0.0  # 최근 bbox 수신 시각
 
     def cb_sync(self, scan_msg, yolo_msg, cam_info_msg):
+        self.get_logger().info("cb_sync 호출")
+        
         """동기화된 콜백: Scan + YOLO + CameraInfo"""
         
         # 1. 데이터 파싱 및 저장
@@ -120,7 +124,7 @@ class LidarCameraProjector(Node):
         ranges = np.array(scan_msg.ranges, dtype=np.float32)
         num = len(ranges)
         angles = scan_msg.angle_min + np.arange(num) * scan_msg.angle_increment
-        valid_mask = np.isfinite(ranges) & (ranges < 5.0)
+        valid_mask = np.isfinite(ranges)
         
         r_valid = ranges[valid_mask]
         a_valid = angles[valid_mask]
@@ -129,15 +133,36 @@ class LidarCameraProjector(Node):
         x = r_valid * np.cos(a_valid)
         y = r_valid * np.sin(a_valid)
         z = np.zeros_like(x)
+
+        pts_lidar = np.column_stack((x, y, z))
+        db = DBSCAN(
+            eps=0.2,       # 두 포인트가 같은 클러스터로 묶이는 최대 거리
+            min_samples=8   # 최소 점 개수
+        ).fit(pts_lidar[:, :2])
+
+        not_noise = db.labels_ != -1
+        pts_lidar = pts_lidar[not_noise]
         
-        pts_lidar = np.column_stack((x, y, z, r_valid, idx_valid))
+        labels = np.unique(db.labels_[not_noise])
+        clusters = []
+        for label in labels:
+            cluster_pts = pts_lidar[db.labels_[not_noise] == label]
+            if len(cluster_pts) == 0:
+                continue
+            # 클러스터의 중심점 계산
+            center_x = np.mean(cluster_pts[:, 0])
+            center_y = np.mean(cluster_pts[:, 1])
+            center_z = 0.
+            
+            clusters.append((center_x, center_y, center_z))
+
+        cluster_pts = np.array(clusters)
+
         if len(pts_lidar) == 0:
             return
 
         # 3D Project to Camera Plane
-        xyz = pts_lidar[:, :3]
-        dist = pts_lidar[:, 3]
-        indices = pts_lidar[:, 4].astype(int)
+        xyz = cluster_pts[:, :3]
 
         xyz_h = np.hstack((xyz, np.ones((len(xyz), 1))))
         xyz_cam = (T_lidar_cam @ xyz_h.T).T[:, :3]
@@ -147,16 +172,10 @@ class LidarCameraProjector(Node):
         # z > 0 check
         valid_z = uv_h[:, 2] > 0
         uv = (uv_h[valid_z, :2] / uv_h[valid_z, 2:3])
-        
-        dist_valid_z = dist[valid_z]
-        indices_valid_z = indices[valid_z]
-
-        # 필터링 결과 버퍼
-        filtered_ranges = np.array([float('inf')] * num)
 
         bbox_msg = PoseArray()
         bbox_msg.header.stamp = scan_msg.header.stamp
-        bbox_msg.header.frame_id = "map"
+        bbox_msg.header.frame_id = "base_link"
 
         if self.latest_bboxes:
             for i, bbox in enumerate(self.latest_bboxes):
@@ -165,60 +184,28 @@ class LidarCameraProjector(Node):
                 in_bbox = (bx1 <= uv[:, 0]) & (uv[:, 0] <= bx2) & (by1 <= uv[:, 1]) & (uv[:, 1] <= by2)
                 if not in_bbox.any():
                     continue
-                
-                indicies = indices_valid_z[in_bbox]
-                dists = dist_valid_z[in_bbox]
 
-                filtered_ranges[indicies] = dists
+                cbx, cby = (bx1 + bx2) / 2, (by1 + by2) / 2
+                idx = np.argmin(np.hypot((uv[in_bbox, 0] - cbx), (uv[in_bbox, 1] - cby)))
 
-                angles = scan_msg.angle_min + indicies * scan_msg.angle_increment
-                x = dists * np.cos(angles)
-                y = dists * np.sin(angles)
-
-                cx, cy = self.lidar_to_map(
-                    np.median(x), 
-                    np.median(y), 
-                    scan_msg.header.stamp)
-
-                if cx is None or cy is None:
-                    continue
+                neareast = xyz[valid_z][in_bbox][idx]
 
                 pose = Pose()
-                pose.position.x = cx
-                pose.position.y = cy
+                pose.position.x, pose.position.y = self.lidar_to_map(neareast[0], neareast[1], None)
                 pose.position.z = 0.0
-
-                pose.orientation.x = 0.0
-                pose.orientation.y = 0.0
-                pose.orientation.z = 0.0
-                pose.orientation.w = 1.0
 
                 bbox_msg.poses.append(pose)
 
         # 3. Publish results
         if len(bbox_msg.poses) > 0:
-            filtered_msg = LaserScan()
-            filtered_msg.header = scan_msg.header
-            filtered_msg.angle_min = scan_msg.angle_min
-            filtered_msg.angle_max = scan_msg.angle_max
-            filtered_msg.angle_increment = scan_msg.angle_increment
-            filtered_msg.time_increment = scan_msg.time_increment
-            filtered_msg.scan_time = scan_msg.scan_time
-            filtered_msg.range_min = scan_msg.range_min
-            filtered_msg.range_max = scan_msg.range_max
-            filtered_msg.ranges = [
-                r if r != float('inf') else float('inf')
-                for r in filtered_ranges
-            ]
-            
-            self.filtered_scan_pub.publish(filtered_msg)
+            self.get_logger().info("dngkgkgkgkgkgk")
             self.fusion_box_pts_pub.publish(bbox_msg)
 
     def lidar_to_map(self, local_x, local_y, time):
         """라이다 좌표계 → map 좌표계 변환"""
         try:
             # 라이다 프레임 → map 프레임 TF 조회
-            tf = self.tf_buffer.lookup_transform('map', self.frame_lidar, time)
+            tf = self.tf_buffer.lookup_transform('base_link', self.frame_lidar, rclpy.time.Time())
         
 
             # 변환 행렬 생성
