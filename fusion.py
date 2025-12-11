@@ -175,7 +175,7 @@ class LidarCameraProjector(Node):
 
         bbox_msg = PoseArray()
         bbox_msg.header.stamp = scan_msg.header.stamp
-        bbox_msg.header.frame_id = "base_link"
+        bbox_msg.header.frame_id = "map"
 
         if self.latest_bboxes:
             for i, bbox in enumerate(self.latest_bboxes):
@@ -205,7 +205,7 @@ class LidarCameraProjector(Node):
         """라이다 좌표계 → map 좌표계 변환"""
         try:
             # 라이다 프레임 → map 프레임 TF 조회
-            tf = self.tf_buffer.lookup_transform('base_link', self.frame_lidar, rclpy.time.Time())
+            tf = self.tf_buffer.lookup_transform('map', self.frame_lidar, rclpy.time.Time())
         
 
             # 변환 행렬 생성
