@@ -17,8 +17,8 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import PoseStamped, Quaternion, Twist
-from std_msgs.msg import String, Float32MultiArray
+from geometry_msgs.msg import Pose, PoseArray, PoseStamped, Quaternion, Twist
+from std_msgs.msg import String
 from visualization_msgs.msg import Marker
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 from tf2_ros import Buffer, TransformListener
@@ -34,7 +34,7 @@ from frontier_utils import compute_frontier_goal
 # ================= [설정] =================
 BOX_CLASS_NAME = "box"       # YOLO 클래스 이름 (모델에 맞게 수정)
 BOX_DEPTH = 0.3              # 박스 깊이 추정 (m) - 박스를 통과하기 위한 값
-BOX_BEHIND_OFFSET = 0.3    # 박스 뒤쪽에서 떨어질 거리 (m)
+BOX_BEHIND_OFFSET = 0.45    # 박스 뒤쪽에서 떨어질 거리 (m)
 CHECKED_BOX_RADIUS = 1.0     # 이미 검사한 박스 반경 (m)
 YOLO_CONF_THRESHOLD = 0.75   # YOLO 신뢰도 임계값 (75%)
 TARGET_BOX_COUNT = 2         # 목표 박스 개수
@@ -59,7 +59,7 @@ class FinalExplorerAsync(Node):
             callback_group=self.callback_group
         )
         self.create_subscription(
-            Float32MultiArray, '/fusion_box_point', self.fusion_callback, 10,
+            PoseArray, '/fusion_box_point', self.fusion_callback, 10,
             callback_group=self.callback_group
         )
         self.create_subscription(
@@ -122,28 +122,63 @@ class FinalExplorerAsync(Node):
         try:
             detections = json.loads(msg.data)
             box_detections = [det for det in detections if det.get('name', '').lower() == 'box']
+            non_box_detections = [det for det in detections if det.get('name', '').lower() != 'box']
             if box_detections:
                 with self.data_lock:
-                    self.yolo_detections = box_detections
+                    self.yolo_detections = non_box_detections
                     self.yolo_timestamp = time.time()
-                self.get_logger().info(f"🔍 YOLO 박스 {len(box_detections)}개 감지! (최고신뢰도: {max([d.get('conf', 0) for d in box_detections]):.2f})")
+
+                self.get_logger().info(f"🔍 YOLO 박스 {len(non_box_detections)}개 감지! (최고신뢰도: {max([d.get('conf', 0) for d in non_box_detections]):.2f})")
         except:
             pass
 
-    def fusion_callback(self, msg):
+    def fusion_callback(self, msg: PoseArray):
         with self.data_lock:
             if self.mode == "APPROACH":
                 self.get_logger().info("이미 APPROACH 모드 - 무시")
                 return
 
-            self.get_logger().info('🎯 퓨전 데이터 수신!')
-            world_x, world_y = msg.data[0], msg.data[1]
-            self.fusion_box_world = (world_x, world_y)  # 월드 좌표로 저장
-            self.fusion_box_timestamp = time.time()
+            if len(msg.poses) == 0:
+                self.get_logger().info("공갈 메세지 수신")
+                return
+
+            self.get_logger().info('🎯 퓨전 박스 수신!')
+
+            self.fusion_box_world = None
+            self.fusion_box_timestamp = None
             
-            self.get_logger().info(
-                f"🎯 퓨전 박스 수신 (월드 좌표): ({world_x:.2f}, {world_y:.2f})"
-            )
+            # 로봇 현재 위치 가져오기
+            robot_pose = self.get_robot_pose()
+            if robot_pose is None:
+                self.get_logger().warn("@@@@@@@@@@@@@@@@ 로봇 위치 불명 - 첫 번째 유효 박스 선택")
+                rx, ry = 0.0, 0.0  # 폴백
+            else:
+                rx, ry, _ = robot_pose
+
+            closest_dist = float('inf')
+            
+            for pos in msg.poses:
+                box_pos = (pos.position.x, pos.position.y)
+                
+                if self.check_duplicate_box(box_pos):
+                    self.get_logger().warn("🚨 이미 방문한 박스 감지! -> 무시함")
+                    continue
+
+                # 로봇과 박스 간 거리 계산
+                dist_to_robot = math.hypot(box_pos[0] - rx, box_pos[1] - ry)
+                
+                if dist_to_robot < closest_dist:
+                    closest_dist = dist_to_robot
+                    self.fusion_box_world = box_pos
+
+            if self.fusion_box_world is not None:
+                self.fusion_box_timestamp = time.time()
+                self.get_logger().info(
+                    f"🎯 퓨전 박스 수신 (월드 좌표): ({self.fusion_box_world[0]:.2f}, {self.fusion_box_world[1]:.2f}), 거리: {closest_dist:.2f}m"
+                )
+            
+            else:
+                self.get_logger().info("🎯 퓨전 박스 수신 (월드 좌표): 없음")
 
     # ===== 유틸리티 =====
     def get_robot_pose(self):
@@ -220,6 +255,15 @@ class FinalExplorerAsync(Node):
         """
         time.sleep(duration_sec)
 
+    def check_duplicate_box(self, target_box_world):
+        tx, ty = target_box_world
+        for (cx, cy) in self.checked_boxes:
+            dist = math.hypot(tx - cx, ty - cy)
+            if dist < CHECKED_BOX_RADIUS:
+                return True
+
+        return False
+
     def rotate_scan(self, duration_sec=10.0, angular_speed=0.3):
         """
         제자리에서 회전하며 YOLO로 박스 스캔
@@ -233,10 +277,9 @@ class FinalExplorerAsync(Node):
         
         for i in range(10):
             self.get_logger().info(f"========== step : {i} ==========")
-            self.stop_robot(0.3)
-
-            # 5초 동안 대기 (백그라운드에서 자동으로 콜백 실행됨!)
-            self.get_logger().info("⏳ 5초 대기 중... (백그라운드 자동 수신)")
+            
+            # 1초 동안 대기 (백그라운드에서 자동으로 콜백 실행됨!)
+            self.get_logger().info("⏳ 1초 대기 중... (백그라운드 자동 수신)")
             self.wait_async(1.0)
             
             # Thread-safe 데이터 읽기
@@ -256,9 +299,9 @@ class FinalExplorerAsync(Node):
             if fusion_ts is not None:
                 fusion_age = time.time() - fusion_ts
                 self.get_logger().info(f"🎯 FUSION: 데이터 있음 ({fusion_age:.2f}초 전)")
-                print(f"Fusion timestamp 차이: {fusion_age}")
+                self.get_logger().info(f"Fusion timestamp 차이: {fusion_age}")
 
-                # 최근 1초 이내면 즉시 성공
+                # 최근 1초 이내면 후보 확인
                 if fusion_age < 1.0:
                     self.stop_robot(0.1)
                     return True
@@ -276,10 +319,10 @@ class FinalExplorerAsync(Node):
             while time.time() < end_rot_time and rclpy.ok():
                 # 회전 명령 퍼블리시
                 self.nav.spin(np.deg2rad(10))
-                time.sleep(0.05)
+                time.sleep(0.1)
             
             # 회전 후 정지 펄스
-            self.stop_robot(0.5)
+            # self.stop_robot(0.5)
         
         # 회전 완료 후 정지
         self.stop_robot()
@@ -300,14 +343,14 @@ def main():
     spin_thread.start()
     
     # Nav2 준비
-    print("Nav2 준비 중...")
+    node.get_logger().info("Nav2 준비 중...")
     node.nav.waitUntilNav2Active(localizer='slam_toolbox')
-    print("준비 완료! 탐사 시작!")
+    node.get_logger().info("준비 완료! 탐사 시작!")
     
     # 맵 대기
     while node.map_data is None:
         time.sleep(1.0)
-        print("맵 기다리는 중...")
+        node.get_logger().info("맵 기다리는 중...")
     
     try:
         while rclpy.ok():
@@ -316,7 +359,7 @@ def main():
             # === Nav2 접근 모드 (APPROACH) ===
             if node.mode == "APPROACH":
                 if node.current_box_pos is None:
-                    print("박스 위치 없음 -> 탐사 복귀")
+                    node.get_logger().info("박스 위치 없음 -> 탐사 복귀")
                     node.mode = "EXPLORE"
                     node.box_detected = False
                     continue
@@ -339,10 +382,10 @@ def main():
                         qz = math.sin(face_angle / 2)
                         qw = math.cos(face_angle / 2)
                         
-                        print(f"[APPROACH] 박스 뒤로 접근 시작!")
-                        print(f"  현재 위치: ({rx:.2f}, {ry:.2f})")
-                        print(f"  박스 앞면: ({bx:.2f}, {by:.2f})")
-                        print(f"  목표 (박스 뒤): ({tx:.2f}, {ty:.2f})")
+                        node.get_logger().info(f"[APPROACH] 박스 뒤로 접근 시작!")
+                        node.get_logger().info(f"  현재 위치: ({rx:.2f}, {ry:.2f})")
+                        node.get_logger().info(f"  박스 앞면: ({bx:.2f}, {by:.2f})")
+                        node.get_logger().info(f"  목표 (박스 뒤): ({tx:.2f}, {ty:.2f})")
 
                         goal = PoseStamped()
                         goal.header.frame_id = 'map'
@@ -354,7 +397,7 @@ def main():
                         
                         # Nav2 goal 전송
                         node.nav.goToPose(goal)
-                        print(f"[APPROACH] Nav2 goal 전송 완료!")
+                        node.get_logger().info(f"[APPROACH] Nav2 goal 전송 완료!")
 
                         # 목표 지점 디버깅용 퍼블리시 (cancelTask 제거!)
                         node.target_point_pub.publish(goal)
@@ -362,32 +405,35 @@ def main():
                         node.is_navigating = True
                         node.box_detected = False
                     else:
-                        print("로봇 위치 불명 -> 탐사 복귀")
+                        node.get_logger().info("로봇 위치 불명 -> 탐사 복귀")
                         node.mode = "EXPLORE"
                         node.box_detected = False
                 
                 elif node.nav.isTaskComplete():
                     result = node.nav.getResult()
                     if result == TaskResult.SUCCEEDED:
-                        print('도착착!!!!!')
+                        node.get_logger().info('도착착!!!!!')
                         # break
 
                         is_final_box = (len(node.checked_boxes) + 1) >= TARGET_BOX_COUNT
                         if is_final_box:
-                            print("박스 도착 완료! 목표 수량 달성.")
+                            node.get_logger().info("박스 도착 완료! 목표 수량 달성.")
                         else:
-                            print("박스 도착 완료! (3초 대기)")
+                            node.get_logger().info("박스 도착 완료! (3초 대기)")
+                            node.get_logger().info("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
+                            node.get_logger().info(f"{node.yolo_detections}")
+                            node.get_logger().info("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
                             node.wait_async(3.0)
                         
                         # 완료 처리
                         node.checked_boxes.append(node.current_box_pos)
-                        print(f"박스 기록 완료 (총 {len(node.checked_boxes)}개)")
+                        node.get_logger().info(f"박스 기록 완료 (총 {len(node.checked_boxes)}개)")
                         if len(node.checked_boxes) >= TARGET_BOX_COUNT:
-                            print("박스 두 개 확인! 탐사를 종료합니다.")
+                            node.get_logger().info("박스 두 개 확인! 탐사를 종료합니다.")
                             node.shutdown_requested = True
                             node.stop_robot()
                     else:
-                        print(f"박스 접근 실패: {result}")
+                        node.get_logger().info(f"박스 접근 실패: {result}")
                     
                     if node.shutdown_requested:
                         node.is_navigating = False
@@ -395,7 +441,7 @@ def main():
                         node.box_detected = False
                         break
                     
-                    print("탐사 모드 복귀")
+                    node.get_logger().info("탐사 모드 복귀")
                     node.mode = "EXPLORE"
                     node.is_navigating = False
                     node.current_box_pos = None
@@ -413,10 +459,10 @@ def main():
                     robot_pose = node.get_robot_pose()
                     target = compute_frontier_goal(map_data, map_info, last_goal, 
                                                    robot_pose=robot_pose, 
-                                                   min_dist=2.0, max_dist=3.0)
+                                                   min_dist=3.0, max_dist=7.0)
                     if target:
                         tx, ty = target
-                        print(f"\n탐사 목표: ({tx:.2f}, {ty:.2f})")
+                        node.get_logger().info(f"\n탐사 목표: ({tx:.2f}, {ty:.2f})")
                         
                         goal = PoseStamped()
                         goal.header.frame_id = 'map'
@@ -429,32 +475,32 @@ def main():
                         node.is_navigating = True
                         node.last_goal = (tx, ty)
                     else:
-                        print("더 이상 갈 곳이 없음 (탐사 완료)")
-                        node.wait_async(2.0)
+                        node.get_logger().info("더 이상 갈 곳이 없음 (탐사 완료)")
+                        node.wait_async(0.5)
                 
                 elif node.nav.isTaskComplete():
                     result = node.nav.getResult()
                     node.is_navigating = False
                     
                     if result == TaskResult.SUCCEEDED:
-                        print("탐사 목표 도착!, 🔄 주변 박스 스캔 시작...")
+                        node.get_logger().info("탐사 목표 도착!, 🔄 주변 박스 스캔 시작...")
                         
                         found = node.rotate_scan(duration_sec=10.0, angular_speed=0.16)
                         if found:
-                            print("박스 발견! APPROACH 모드로 전환됨")
+                            node.get_logger().info("박스 발견! APPROACH 모드로 전환됨")
                             with node.data_lock:
                                 node.current_box_pos = node.fusion_box_world
                             node.mode = "APPROACH"
 
                     else:
                         # 실패 시 바로 다음 목표로 (회전 스캔 생략)
-                        print(f"탐사 목표 도달 실패: {result} → 다음 목표로")
+                        node.get_logger().info(f"탐사 목표 도달 실패: {result} → 다음 목표로")
 
     except KeyboardInterrupt:
-        print("\n사용자 종료")
+        node.get_logger().info("\n사용자 종료")
 
     if node.shutdown_requested:
-        print("목표 박스 두 개 확보 완료. 노드를 종료합니다.")
+        node.get_logger().info("목표 박스 두 개 확보 완료. 노드를 종료합니다.")
 
     executor.shutdown()
     node.nav.lifecycleShutdown()
