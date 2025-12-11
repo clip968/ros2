@@ -16,7 +16,7 @@ from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from nav_msgs.msg import OccupancyGrid
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, CompressedImage
 from geometry_msgs.msg import Pose, PoseArray, PoseStamped, Quaternion, Twist
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker
@@ -27,6 +27,7 @@ import cv2
 import time
 import math
 import json
+from cv_bridge import CvBridge
 import threading
 from stop_utils import CmdStopper
 from frontier_utils import compute_frontier_goal
@@ -34,7 +35,7 @@ from frontier_utils import compute_frontier_goal
 # ================= [설정] =================
 BOX_CLASS_NAME = "box"       # YOLO 클래스 이름 (모델에 맞게 수정)
 BOX_DEPTH = 0.3              # 박스 깊이 추정 (m) - 박스를 통과하기 위한 값
-BOX_BEHIND_OFFSET = 0.45    # 박스 뒤쪽에서 떨어질 거리 (m)
+BOX_BEHIND_OFFSET = 0.55    # 박스 뒤쪽에서 떨어질 거리 (m)
 CHECKED_BOX_RADIUS = 1.0     # 이미 검사한 박스 반경 (m)
 YOLO_CONF_THRESHOLD = 0.75   # YOLO 신뢰도 임계값 (75%)
 TARGET_BOX_COUNT = 2         # 목표 박스 개수
@@ -53,6 +54,8 @@ class FinalExplorerAsync(Node):
         # Thread-safe를 위한 Lock
         self.data_lock = threading.Lock()
         
+        self.bridge = CvBridge()
+
         # 1. 구독자 설정 (모두 callback_group에 배치)
         self.create_subscription(
             OccupancyGrid, '/map', self.map_callback, 10,
@@ -66,7 +69,9 @@ class FinalExplorerAsync(Node):
             String, '/yolo_detections', self.yolo_callback, 10,
             callback_group=self.callback_group
         )
-        
+
+        self.sub_img  = self.create_subscription(CompressedImage, "/yolo_result", self.cb_image, 10)
+
         # 2. 퍼블리셔
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.marker_pub = self.create_publisher(Marker, '/box_marker', 10)
@@ -109,6 +114,8 @@ class FinalExplorerAsync(Node):
 
         self.nav = BasicNavigator()
 
+        self.yolo_img = None
+
 
     # ===== 콜백 함수 (Thread-safe) =====
     def map_callback(self, msg):
@@ -116,6 +123,11 @@ class FinalExplorerAsync(Node):
             self.map_info = msg.info
             # occupancy grid를 numpy 배열로 변환
             self.map_data = np.array(msg.data).reshape((msg.info.height, msg.info.width))
+
+    def cb_image(self, msg: CompressedImage):
+        """이미지 저장 및 시각화 (Fusion Overlay)"""
+        self.yolo_img = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        
 
     def yolo_callback(self, msg):
         """YOLO 감지 디버깅용 - 박스가 실제로 감지되는지 확인"""
@@ -304,12 +316,16 @@ class FinalExplorerAsync(Node):
                 # 최근 1초 이내면 후보 확인
                 if fusion_age < 1.0:
                     self.stop_robot(0.1)
+
+                    if self.yolo_img is not None:
+                        cv2.imwrite(f'capture_{len(self.checked_boxes)}.jpg', self.yolo_img)
+
                     return True
             
             else:
                 self.get_logger().info("🎯 FUSION: 데이터 없음")
 
-            # 다음 스텝: 약간 회전
+            # 다음 스텝: 약간
             target_angle = np.deg2rad(10)
             angular_speed = 0.3  # rad/s
             rotate_duration = abs(target_angle) / angular_speed
